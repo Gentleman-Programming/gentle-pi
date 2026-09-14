@@ -1,14 +1,18 @@
 import assert from "node:assert/strict";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import { createRequire, syncBuiltinESMExports } from "node:module";
-import { join, relative, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep, win32 } from "node:path";
 import { pendingReviewMutation, REVIEW_REMINDER_RECEIPT } from "../lib/review-reminder-receipt.ts";
 import { SESSION_WORKTREE_ENTRY, SESSION_WORKTREE_CHANGED } from "../lib/session-worktree-registry.ts";
-import test, { after, mock } from "node:test";
+import test, { after, afterEach, mock } from "node:test";
+import type { TestContext } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, type TuiMouseEvent } from "@earendil-works/pi-tui";
-import gentleAgents, { agentRuntimePaths, agentsCollapseKey, agentsEnabled, agentsStopKey, agentsViewKey, answerThroughUi, completionText, legacySubagentsInstalled, type AgentsDeps } from "../extensions/gentle-agents.ts";
+import gentleAgents, { agentRuntimePaths, agentsCollapseKey, agentsEnabled, agentsStopKey, agentsViewKey, answerThroughUi, completionText, createDefaultSessionTransport, legacySubagentsInstalled, type AgentsDeps, type SessionTransportFactory } from "../extensions/gentle-agents.ts";
+import { ActiveSessionClient, ActiveSessionListener, SessionPresenceRegistry } from "../lib/agents-session-transport.ts";
+import { WindowsActiveSessionClient, WindowsActiveSessionListener } from "../lib/windows-session-transport.ts";
 import { historyDir, loadHistory, saveTask } from "../lib/agents-history.ts";
 import { STALE_COMPLETION_MS } from "../lib/agents-completion-delivery.ts";
 import { emptyThread, TASK_EVENT, TASK_STATUS, TaskStore, type TaskRecord } from "../lib/agents-protocol.ts";
@@ -44,6 +48,21 @@ const PARENT_CONFIRMED_SDD_CONTEXT = renderSddPreflightPrompt({
 	prompted: true,
 });
 
+const inertSessionTransport: SessionTransportFactory = {
+	createRegistry: async () => ({ list: async () => [], listActivations: async () => [] }),
+	createListener: (registry) => ({ registry, start: async () => {}, close: async () => {} }),
+	createClient: () => ({ close() {}, sendNotification: async () => { throw new Error("inert session transport must not send notifications"); } }),
+};
+
+function containsResolvedPath(
+	candidate: string,
+	path: string,
+	paths: Pick<typeof win32, "isAbsolute" | "relative" | "sep"> = { isAbsolute, relative, sep },
+): boolean {
+	const fromCandidate = paths.relative(candidate, path);
+	return fromCandidate === "" || (!paths.isAbsolute(fromCandidate) && fromCandidate !== ".." && !fromCandidate.startsWith(`..${paths.sep}`));
+}
+
 type Overlay = {
 	render(width: number): string[];
 	handleInput(data: string): void;
@@ -60,8 +79,14 @@ function mouse(
 ): TuiMouseEvent {
 	return { type, button, x, y, screenX: x, screenY: y, width, height, shift: false, alt: false, ctrl: false };
 }
-const root = mkdtempSync(join(tmpdir(), "gentle-agents-ext-"));
-after(() => rmSync(root, { recursive: true, force: true }));
+const root = realpathSync(mkdtempSync(join(tmpdir(), "gentle-agents-ext-")));
+const activeSessionTeardowns = new Set<() => Promise<void>>();
+const stopActiveSessions = () => Promise.all([...activeSessionTeardowns].map((shutdown) => shutdown()));
+afterEach(stopActiveSessions);
+after(async () => {
+	try { await stopActiveSessions(); }
+	finally { rmSync(root, { recursive: true, force: true }); }
+});
 const home = join(root, "home");
 const cwd = join(root, "project");
 const nonGitCwd = join(root, "non-git-project");
@@ -99,8 +124,24 @@ function fakePi() {
 		registerShortcut: (key: string, registration: { description: string; handler(ctx: ExtensionContext): Promise<void> }) => shortcuts.set(key, registration),
 		registerCommand: (name: string, registration: { handler(args: string, ctx: ExtensionContext): Promise<void> }) => commands.set(name, registration),
 	} as unknown as ExtensionAPI;
+	let activeSession: ExtensionContext | undefined;
+	const teardown = async () => {
+		const ctx = activeSession;
+		if (ctx === undefined) return;
+		await fire("session_shutdown", ctx, { reason: "quit" });
+	};
 	const fire = async (event: string, ctx: ExtensionContext, payload: unknown = {}) => {
-		for (const handler of handlers.get(event) ?? []) await handler(payload, ctx);
+		try {
+			for (const handler of handlers.get(event) ?? []) await handler(payload, ctx);
+		} finally {
+			if (event === "session_start") {
+				activeSession = ctx;
+				activeSessionTeardowns.add(teardown);
+			} else if (event === "session_shutdown" && activeSession === ctx) {
+				activeSession = undefined;
+				activeSessionTeardowns.delete(teardown);
+			}
+		}
 	};
 	return { pi, tools, shortcuts, commands, fire, sent, renderers, entryRenderers, entries, events, listeners };
 }
@@ -175,6 +216,7 @@ function deps(): { deps: Partial<AgentsDeps>; children: FakeChild[]; spawned: st
 			home,
 			resolveWorktree: (path, base) => ({ root: resolve(base, path), commonDir: "/fixture/common" }),
 			env: { PATH: "/bin" },
+			sessionTransport: inertSessionTransport,
 		},
 	};
 }
@@ -182,8 +224,9 @@ function deps(): { deps: Partial<AgentsDeps>; children: FakeChild[]; spawned: st
 test("all nine subagent registrations own their transcript shell", () => {
 	const { pi, tools } = fakePi();
 	gentleAgents(pi, {}, deps().deps);
-	assert.equal(tools.size, 9);
-	for (const tool of tools.values()) assert.equal(tool.renderShell, "self", tool.name);
+	const subagentTools = [...tools.values()].filter((tool) => tool.name.startsWith("subagent_"));
+	assert.equal(subagentTools.length, 9);
+	for (const tool of subagentTools) assert.equal(tool.renderShell, "self", tool.name);
 });
 
 test("host query delivery exposes correlation and accepts one current-session reply", async () => {
@@ -318,6 +361,359 @@ test("foreground handoff survives settlement before its original await resumes",
 });
 
 const tick = () => new Promise((resolve) => setImmediate(resolve));
+type LifecycleOutcome = { status: "fulfilled" } | { status: "rejected"; error: unknown };
+type LifecycleState = { status: "pending" | "fulfilled" | "rejected"; outcome?: LifecycleOutcome };
+const observeLifecycle = <T>(promise: Promise<T>, state: LifecycleState): Promise<LifecycleOutcome> => promise.then(() => { const outcome = { status: "fulfilled" as const }; state.status = outcome.status; state.outcome = outcome; return outcome; }, (error) => { const outcome = { status: "rejected" as const, error }; state.status = outcome.status; state.outcome = outcome; return outcome; });
+const boundedLifecycle = async <T>(promise: Promise<T>, label: string) => {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try { return await Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), 2000); })]); }
+	finally { if (timer) clearTimeout(timer); }
+};
+
+const drainLifecycle = async (label: string, promise: Promise<LifecycleOutcome>) => {
+	try { return { label, outcome: await boundedLifecycle(promise, label) }; }
+	catch (error) { return { label, error }; }
+};
+
+test("overlapping session transport startups preserve ownership and shutdown waits for every pending operation", async (t: TestContext) => {
+	const h = fakePi();
+	const runtime = deps();
+	let sessionId = "old";
+	const registryGates: Array<() => void> = [];
+	const listenerStarts: string[] = [], listenerCloses: string[] = [], clientCloses: string[] = [], registryCloseCalls: string[] = [], registryCloseEffects: string[] = [];
+	const registries = new Map<string, { closed: boolean; close(): Promise<void> }>();
+	const transport: SessionTransportFactory = {
+		createRegistry: async () => {
+			const id = sessionId;
+			await new Promise<void>((resolve) => registryGates.push(resolve));
+			const registry = { sessionId: id, closed: false, list: async () => [], listActivations: async () => [], close: async () => { registryCloseCalls.push(id); if (!registry.closed) { registry.closed = true; registryCloseEffects.push(id); } } };
+			registries.set(id, registry);
+			return registry;
+		},
+		createListener: (registry, id) => ({ registry, closesRegistry: true, start: async () => { listenerStarts.push(id); }, close: async () => { listenerCloses.push(id); await registry.close?.(); } }),
+		createClient: (_registry, id) => ({ close: () => { clientCloses.push(id); }, sendNotification: async () => ({ id: "unused", accepted: true }) }),
+	};
+	runtime.deps.sessionTransport = transport;
+	gentleAgents(h.pi, {}, runtime.deps);
+	const { ctx } = fakeContext();
+	(ctx.sessionManager as { getSessionId(): string }).getSessionId = () => sessionId;
+	const launched: Array<{ state: LifecycleState; outcome: Promise<LifecycleOutcome> }> = [];
+	const launch = <T>(promise: Promise<T>) => { const state: LifecycleState = { status: "pending" }; const outcome = observeLifecycle(promise, state); launched.push({ state, outcome }); return { state, outcome }; };
+	let shutdownRecord: ReturnType<typeof launch> | undefined;
+	let primary: unknown;
+	try {
+		const first = h.fire("session_start", ctx, { reason: "startup" });
+		launch(first);
+		await tick();
+		sessionId = "new";
+		const second = h.fire("session_start", ctx, { reason: "new" });
+		const secondRecord = launch(second);
+		await tick();
+		assert.equal(registryGates.length, 2, "both starts must own pending registry creation");
+		registryGates[1]!();
+		await eventually(() => listenerStarts.includes("new"), "current startup must publish after its registry is ready");
+		const shutdown = h.fire("session_shutdown", ctx, { reason: "quit" });
+		shutdownRecord = launch(shutdown);
+		await tick();
+		assert.equal(secondRecord.state.status, "fulfilled", "the current startup settles before shutdown begins");
+		assert.equal(shutdownRecord?.state.status, "pending", "shutdown must wait for the older pending startup, not only the current startup");
+		registryGates[0]!();
+		assert.equal(registries.has("old"), false, "the released old registry gate has not yet completed acquisition");
+		assert.equal(registries.get("old")?.closed, undefined, "the retained old registry cannot be closed before acquisition completes");
+		await eventually(() => launched.every(({ state }) => state.status !== "pending"), "all launched lifecycle operations must settle after gate release");
+		const outcomes = await Promise.all(launched.map(({ outcome }) => outcome));
+		assert.ok(outcomes.every((outcome) => outcome.status === "fulfilled"), "all launched lifecycle operations must fulfill");
+		assert.deepEqual(listenerStarts, ["new"], "the stale startup must never publish");
+		assert.deepEqual(clientCloses, ["new"], "the current client closes exactly once");
+		assert.deepEqual(listenerCloses, ["new"], "the current listener closes exactly once");
+		assert.deepEqual(registryCloseCalls.sort(), ["new", "old"], "each owned registry close is invoked exactly once");
+		assert.deepEqual(registryCloseEffects.sort(), ["new", "old"], "each owned registry closes exactly once");
+		assert.equal(registries.get("old")?.closed, true);
+		assert.equal(registries.get("new")?.closed, true);
+	} catch (error) {
+		primary = error;
+	} finally {
+		for (const release of registryGates) release();
+		if (shutdownRecord === undefined) shutdownRecord = launch(h.fire("session_shutdown", ctx, { reason: "cleanup" }));
+		if (launched.length > 0) {
+			try {
+				await eventually(() => launched.every(({ state }) => state.status !== "pending"), "all launched lifecycle operations must settle during cleanup");
+				const outcomes = await Promise.all(launched.map(({ outcome }) => outcome));
+				const cleanupFailure = outcomes.find((outcome) => outcome.status === "rejected");
+				if (cleanupFailure?.status === "rejected") {
+					if (primary === undefined) primary = cleanupFailure.error;
+					else t.diagnostic(`Lifecycle cleanup secondary failure: ${cleanupFailure.error instanceof Error ? cleanupFailure.error.message : String(cleanupFailure.error)}`);
+				}
+			} catch (error) {
+				if (primary === undefined) primary = error;
+				else t.diagnostic(`Lifecycle cleanup secondary failure: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
+	}
+	if (primary !== undefined) throw primary;
+});
+
+test("session_start does not block a subsequently registered handler on registry creation", async (t: TestContext) => {
+	const h = fakePi();
+	const runtime = deps();
+	let registryEntered = false;
+	let listenerCreated = false;
+	let clientCreated = false;
+	let listenerClosed = 0;
+	let clientClosed = 0;
+	let releaseRegistry!: () => void;
+	const registryGate = new Promise<void>((resolve) => { releaseRegistry = resolve; });
+	const transport: SessionTransportFactory = {
+		createRegistry: async () => {
+			registryEntered = true;
+			await registryGate;
+			return { list: async () => [], listActivations: async () => [] };
+		},
+		createListener: (registry) => { listenerCreated = true; return { registry, start: async () => {}, close: async () => { listenerClosed++; } }; },
+		createClient: () => { clientCreated = true; return { close() { clientClosed++; }, sendNotification: async () => ({ id: "unused", accepted: true }) }; },
+	};
+	runtime.deps.sessionTransport = transport;
+	gentleAgents(h.pi, {}, runtime.deps);
+	let laterFinished = false;
+	h.pi.on("session_start", async () => { laterFinished = true; });
+	const { ctx } = fakeContext();
+	let outcome: Promise<LifecycleOutcome> | undefined;
+	let lifecycleState: LifecycleState | undefined;
+	let primary: unknown;
+	try {
+		const started = h.fire("session_start", ctx, { reason: "startup" });
+		lifecycleState = { status: "pending" };
+		outcome = observeLifecycle(started, lifecycleState);
+		await eventually(() => registryEntered, "registry gate must be entered before the bounded handler assertion");
+		await eventually(() => laterFinished, "a subsequently registered session_start handler must finish while registry creation is gated");
+		releaseRegistry();
+		assert.ok(outcome);
+		assert.equal((await outcome).status, "fulfilled");
+	} catch (error) {
+		primary = error;
+	} finally {
+		releaseRegistry();
+		try {
+			if (outcome !== undefined) {
+				await eventually(() => listenerCreated && clientCreated, "registry-gated startup must acquire owned resources before cleanup shutdown");
+				const shutdownState: LifecycleState = { status: "pending" };
+				const shutdownOutcome = observeLifecycle(h.fire("session_shutdown", ctx, { reason: "cleanup" }), shutdownState);
+				await eventually(() => lifecycleState?.status !== "pending" && shutdownState.status !== "pending", "registry-gated startup cleanup must settle all launched operations");
+				const cleanupOutcomes = await Promise.all([outcome, shutdownOutcome]);
+				assert.equal(listenerClosed, 1, "cleanup closes the owned listener");
+				assert.equal(clientClosed, 1, "cleanup closes the owned client");
+				const cleanupFailure = cleanupOutcomes.find((value) => value.status === "rejected");
+				if (cleanupFailure?.status === "rejected") {
+					if (primary === undefined) primary = cleanupFailure.error;
+					else t.diagnostic(`Registry-gate cleanup secondary failure: ${cleanupFailure.error instanceof Error ? cleanupFailure.error.message : String(cleanupFailure.error)}`);
+				}
+			}
+		} catch (error) {
+			if (primary === undefined) primary = error;
+			else t.diagnostic(`Registry-gate cleanup secondary failure: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+	if (primary !== undefined) throw primary;
+});
+
+test("session_start does not block a subsequently registered handler on listener publication", async (t: TestContext) => {
+	const h = fakePi();
+	const runtime = deps();
+	let listenerEntered = false;
+	let listenerClosed = 0;
+	let clientClosed = 0;
+	let releaseListener!: () => void;
+	const listenerGate = new Promise<void>((resolve) => { releaseListener = resolve; });
+	const registry = { list: async () => [], listActivations: async () => [] };
+	const transport: SessionTransportFactory = {
+		createRegistry: async () => registry,
+		createListener: (ownedRegistry) => ({
+			registry: ownedRegistry,
+			start: async () => { listenerEntered = true; await listenerGate; },
+			close: async () => { listenerClosed++; },
+		}),
+		createClient: () => ({ close() { clientClosed++; }, sendNotification: async () => ({ id: "unused", accepted: true }) }),
+	};
+	runtime.deps.sessionTransport = transport;
+	gentleAgents(h.pi, {}, runtime.deps);
+	let laterFinished = false;
+	h.pi.on("session_start", async () => { laterFinished = true; });
+	const { ctx } = fakeContext();
+	let outcome: Promise<LifecycleOutcome> | undefined;
+	let lifecycleState: LifecycleState | undefined;
+	let primary: unknown;
+	try {
+		const started = h.fire("session_start", ctx, { reason: "startup" });
+		lifecycleState = { status: "pending" };
+		outcome = observeLifecycle(started, lifecycleState);
+		await eventually(() => listenerEntered, "listener gate must be entered after registry creation");
+		await eventually(() => laterFinished, "a subsequently registered session_start handler must finish while listener publication is gated");
+		releaseListener();
+		assert.ok(outcome);
+		assert.equal((await outcome).status, "fulfilled");
+	} catch (error) {
+		primary = error;
+	} finally {
+		releaseListener();
+		try {
+			if (outcome !== undefined) {
+				const shutdownState: LifecycleState = { status: "pending" };
+				const shutdownOutcome = observeLifecycle(h.fire("session_shutdown", ctx, { reason: "cleanup" }), shutdownState);
+				await eventually(() => lifecycleState?.status !== "pending" && shutdownState.status !== "pending", "listener-gated startup cleanup must settle all launched operations");
+				const cleanupOutcomes = await Promise.all([outcome, shutdownOutcome]);
+				assert.equal(listenerClosed, 1, "cleanup closes the owned listener");
+				assert.equal(clientClosed, 1, "cleanup closes the owned client");
+				const cleanupFailure = cleanupOutcomes.find((value) => value.status === "rejected");
+				if (cleanupFailure?.status === "rejected") {
+					if (primary === undefined) primary = cleanupFailure.error;
+					else t.diagnostic(`Listener-gate cleanup secondary failure: ${cleanupFailure.error instanceof Error ? cleanupFailure.error.message : String(cleanupFailure.error)}`);
+				}
+			}
+		} catch (error) {
+			if (primary === undefined) primary = error;
+			else t.diagnostic(`Listener-gate cleanup secondary failure: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+	if (primary !== undefined) throw primary;
+});
+
+test("replacement closes a gated stale listener once and leaves the successor owned until shutdown", async (t: TestContext) => {
+	const h = fakePi();
+	const runtime = deps();
+	let sessionId = "alpha";
+	let releaseAlpha!: () => void;
+	const alphaGate = new Promise<void>((resolve) => { releaseAlpha = resolve; });
+	let alphaEntered = false, betaStarted = false, betaClientCreated = false;
+	let alphaCallback: ((notification: { id: string; senderSessionId: string; message: string }) => Promise<void>) | undefined;
+	let alphaCloses = 0, betaCloses = 0, alphaClientCloses = 0, betaClientCloses = 0;
+	const registryCloseCalls: string[] = [], registryCloseEffects: string[] = [];
+	const transport: SessionTransportFactory = {
+		createRegistry: async () => {
+			const id = sessionId;
+			const ownedRegistry = { list: async () => [], listActivations: async () => [], closed: false, close: async () => { registryCloseCalls.push(id); if (!ownedRegistry.closed) { ownedRegistry.closed = true; registryCloseEffects.push(id); } } };
+			return ownedRegistry;
+		},
+		createListener: (ownedRegistry, id, callback) => {
+			if (id === "alpha") alphaCallback = callback;
+			return { registry: ownedRegistry, closesRegistry: true, start: async () => { if (id === "alpha") { alphaEntered = true; await alphaGate; } else betaStarted = true; }, close: async () => { if (id === "alpha") alphaCloses++; else betaCloses++; await ownedRegistry.close?.(); } };
+		},
+		createClient: (_registry, id) => { if (id === "beta") betaClientCreated = true; return { close: () => { if (id === "alpha") alphaClientCloses++; else betaClientCloses++; }, sendNotification: async () => ({ id: "unused", accepted: true }) }; },
+	};
+	runtime.deps.sessionTransport = transport;
+	gentleAgents(h.pi, {}, runtime.deps);
+	const { ctx } = fakeContext();
+	(ctx.sessionManager as { getSessionId(): string }).getSessionId = () => sessionId;
+	let primary: unknown;
+	let alphaOutcome: Promise<LifecycleOutcome> | undefined;
+	let betaOutcome: Promise<LifecycleOutcome> | undefined;
+	let shutdownOutcome: Promise<LifecycleOutcome> | undefined;
+	let shutdownState: LifecycleState | undefined;
+	try {
+		alphaOutcome = observeLifecycle(h.fire("session_start", ctx, { reason: "alpha" }), { status: "pending" });
+		await eventually(() => alphaEntered, "replacement test must enter the alpha listener gate");
+		sessionId = "beta";
+		betaOutcome = observeLifecycle(h.fire("session_start", ctx, { reason: "beta" }), { status: "pending" });
+		assert.ok(betaOutcome);
+		assert.equal((await boundedLifecycle(betaOutcome, "successor startup")).status, "fulfilled");
+		await eventually(() => betaClientCreated && betaStarted, "replacement must acquire and publish the successor before ownership assertions");
+		assert.equal(betaClientCloses, 0, "replacement must not close the successor client");
+		assert.equal(betaCloses, 0, "replacement must not close the successor listener");
+		assert.ok(alphaCallback, "the gated listener registered its callback before start");
+		await boundedLifecycle(assert.rejects(alphaCallback!({ id: "late", senderSessionId: "peer", message: "late" }), /stale session transport/), "stale callback rejection");
+		shutdownState = { status: "pending" };
+		shutdownOutcome = observeLifecycle(h.fire("session_shutdown", ctx, { reason: "quit" }), shutdownState);
+		await boundedLifecycle(tick(), "replacement shutdown scheduling");
+		assert.equal(shutdownState.status, "pending", "shutdown waits while the replaced listener startup remains gated");
+		releaseAlpha();
+		assert.ok(alphaOutcome);
+		assert.equal((await boundedLifecycle(alphaOutcome, "stale alpha startup")).status, "fulfilled");
+		assert.equal(alphaClientCloses, 1, "stale alpha client closes once after its gate releases");
+		assert.equal(alphaCloses, 1, "stale alpha listener closes once after its gate releases");
+		assert.ok(shutdownOutcome);
+		assert.equal((await boundedLifecycle(shutdownOutcome, "successor shutdown")).status, "fulfilled");
+		assert.equal(betaClientCloses, 1, "shutdown closes the successor client once");
+		assert.equal(betaCloses, 1, "shutdown closes the successor listener once");
+		assert.deepEqual(registryCloseCalls.sort(), ["alpha", "beta"], "each owned registry close is invoked once");
+		assert.deepEqual(registryCloseEffects.sort(), ["alpha", "beta"], "each owned registry closes once");
+	} catch (error) {
+		primary = error;
+	} finally {
+		releaseAlpha();
+		try {
+			if (shutdownOutcome === undefined) shutdownOutcome = observeLifecycle(h.fire("session_shutdown", ctx, { reason: "cleanup" }), { status: "pending" });
+			const cleanup = await Promise.all([
+				...(alphaOutcome === undefined ? [] : [drainLifecycle("alpha cleanup", alphaOutcome)]),
+				...(betaOutcome === undefined ? [] : [drainLifecycle("beta cleanup", betaOutcome)]),
+				...(shutdownOutcome === undefined ? [] : [drainLifecycle("shutdown cleanup", shutdownOutcome)]),
+			]);
+			for (const result of cleanup) {
+				if ("error" in result) {
+					if (primary === undefined) primary = result.error;
+					else t.diagnostic(`${result.label} secondary failure: ${result.error instanceof Error ? result.error.message : String(result.error)}`);
+				} else if (result.outcome.status === "rejected") {
+					if (primary === undefined) primary = result.outcome.error;
+					else t.diagnostic(`${result.label} secondary rejection: ${result.outcome.error instanceof Error ? result.outcome.error.message : String(result.outcome.error)}`);
+				}
+			}
+		} catch (error) {
+			if (primary === undefined) primary = error;
+			else t.diagnostic(`replacement cleanup secondary failure: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+	if (primary !== undefined) throw primary;
+});
+
+test("startup cleanup contains client-close failure and still closes the remaining owned resources", async (t: TestContext) => {
+	const h = fakePi();
+	const runtime = deps();
+	const startupError = new Error("listener unavailable");
+	const clientError = new Error("client close failed");
+	let listenerCloses = 0, registryCloses = 0, clientCloseAttempts = 0;
+	const registry = { list: async () => [], listActivations: async () => [], close: async () => { registryCloses++; } };
+	runtime.deps.sessionTransport = {
+		createRegistry: async () => registry,
+		createListener: () => ({ registry, start: async () => { throw startupError; }, close: async () => { listenerCloses++; } }),
+		createClient: () => ({ close: () => { clientCloseAttempts++; throw clientError; }, sendNotification: async () => ({ id: "unused", accepted: true }) }),
+	};
+	gentleAgents(h.pi, {}, runtime.deps);
+	const { ctx } = fakeContext();
+	const outcome = observeLifecycle(h.fire("session_start", ctx, { reason: "startup" }), { status: "pending" });
+	let shutdownOutcome: Promise<LifecycleOutcome> | undefined;
+	let primary: unknown;
+	try {
+		assert.equal((await boundedLifecycle(outcome, "startup failure settlement")).status, "fulfilled", "startup failure remains contained");
+		await eventually(() => clientCloseAttempts === 1 && listenerCloses === 1 && registryCloses === 1, "startup cleanup attempts all owned resources before counter assertions");
+		assert.equal(clientCloseAttempts, 1, "startup cleanup attempts the owned client once");
+		assert.equal(listenerCloses, 1, "startup cleanup attempts the owned listener once");
+		assert.equal(registryCloses, 1, "startup cleanup attempts the owned registry once");
+		shutdownOutcome = observeLifecycle(h.fire("session_shutdown", ctx, { reason: "verified-cleanup" }), { status: "pending" });
+		assert.equal((await boundedLifecycle(shutdownOutcome, "verified startup shutdown")).status, "fulfilled");
+	} catch (error) {
+		primary = error;
+	} finally {
+		try {
+			if (shutdownOutcome === undefined) shutdownOutcome = observeLifecycle(h.fire("session_shutdown", ctx, { reason: "cleanup" }), { status: "pending" });
+			assert.ok(shutdownOutcome);
+			const cleanup = await Promise.all([
+				drainLifecycle("startup cleanup", outcome),
+				drainLifecycle("startup shutdown", shutdownOutcome),
+			]);
+			for (const result of cleanup) {
+				if ("error" in result) {
+					if (primary === undefined) primary = result.error;
+					else t.diagnostic(`${result.label} secondary failure: ${result.error instanceof Error ? result.error.message : String(result.error)}`);
+				} else if (result.outcome.status === "rejected") {
+					if (primary === undefined) primary = result.outcome.error;
+					else t.diagnostic(`${result.label} secondary rejection: ${result.outcome.error instanceof Error ? result.outcome.error.message : String(result.outcome.error)}`);
+				}
+			}
+		} catch (error) {
+			if (primary === undefined) primary = error;
+			else t.diagnostic(`startup cleanup secondary failure: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+	if (primary !== undefined) throw primary;
+});
 
 test("child parent-message tooling admits notifications and the active parent preserves raw model text", async () => {
 	const child = fakePi();
@@ -844,7 +1240,7 @@ for (const scenario of ["own", "other-root", "escaped", "sibling", "session-swit
 		ctx.sessionManager.getBranch = (() => h.entries) as typeof ctx.sessionManager.getBranch;
 		d.deps.resolveWorktree = (path, base) => {
 			const absolute = resolve(base, path);
-			const worktree = [cwd, sibling].find((candidate) => absolute === candidate || absolute.startsWith(`${candidate}/`));
+			const worktree = [cwd, sibling].find((candidate) => containsResolvedPath(candidate, absolute));
 			return worktree ? { root: worktree, commonDir: "/fixture/common" } : undefined;
 		};
 		const spawn = d.deps.spawn!;
@@ -876,6 +1272,14 @@ for (const scenario of ["own", "other-root", "escaped", "sibling", "session-swit
 	});
 }
 
+test("worktree attribution containment respects Windows path boundaries", () => {
+	const candidate = win32.resolve("C:\\fixture", "project");
+	assert.equal(containsResolvedPath(candidate, win32.resolve(candidate), win32), true, "the worktree root itself is contained");
+	assert.equal(containsResolvedPath(candidate, win32.resolve(candidate, "nested", "file.ts"), win32), true, "Windows descendants are contained");
+	assert.equal(containsResolvedPath(candidate, win32.resolve(candidate, ".."), win32), false, "the parent is excluded");
+	assert.equal(containsResolvedPath(candidate, win32.resolve("C:\\fixture", "project-sibling", "file.ts"), win32), false, "a sibling prefix is excluded");
+});
+
 test("default Node spawn adapter distinguishes IPC-only and permission-capable canonical Git children", async () => {
 	const childProcess = createRequire(import.meta.url)("node:child_process") as typeof import("node:child_process");
 	const originalSpawn = childProcess.spawn;
@@ -883,23 +1287,16 @@ test("default Node spawn adapter distinguishes IPC-only and permission-capable c
 	const captured: Array<{ command: string; args: readonly string[]; options: CapturedSpawnOptions }> = [];
 	const children: FakeChild[] = [];
 	const shutdown: Array<() => Promise<void>> = [];
-	const canonicalGitCwd = join(root, "canonical-git-project");
-	const gitBin = join(root, "canonical-git-bin");
-	mkdirSync(join(canonicalGitCwd, ".git"), { recursive: true });
-	mkdirSync(gitBin, { recursive: true });
-	const gitFixture = join(gitBin, "git");
-	writeFileSync(gitFixture, `#!/bin/sh\nif [ "$1" = "-C" ] && [ "$2" = "${canonicalGitCwd}" ] && [ "$3" = "rev-parse" ] && [ "$4" = "--git-common-dir" ]; then\n  printf '.git\\n'\n  exit 0\nfi\nexit 1\n`);
-	chmodSync(gitFixture, 0o755);
-	const withCanonicalGitFixture = <T>(action: () => T): T => {
-		const previousPath = process.env.PATH;
-		process.env.PATH = gitBin;
-		try {
-			return action();
-		} finally {
-			if (previousPath === undefined) delete process.env.PATH;
-			else process.env.PATH = previousPath;
-		}
-	};
+	const canonicalGitFixture = mkdtempSync(join(tmpdir(), "gentle-agents-canonical-git-"));
+	const canonicalGitCwd = join(canonicalGitFixture, "project");
+	const gitTemplate = join(canonicalGitFixture, "template");
+	try {
+		mkdirSync(gitTemplate);
+		execFileSync("git", ["init", "--quiet", `--template=${gitTemplate}`, canonicalGitCwd]);
+	} catch (error) {
+		rmSync(canonicalGitFixture, { recursive: true, force: true });
+		throw error;
+	}
 	childProcess.spawn = ((command: string, args: readonly string[], options: Record<string, unknown>) => {
 		captured.push({ command, args, options: options as unknown as CapturedSpawnOptions });
 		const child = fakeChild();
@@ -910,12 +1307,12 @@ test("default Node spawn adapter distinguishes IPC-only and permission-capable c
 	try {
 		const launch = async (mode: "task" | "background", env: NodeJS.ProcessEnv, sessionCwd = nonGitCwd) => {
 			const h = fakePi();
-			gentleAgents(h.pi, env, { home, agentHome: join(home, ".pi", "agent"), env, pi: { command: "/fixture/pi", args: ["--host-flag"] }, resolveWorktree: () => undefined });
+			gentleAgents(h.pi, env, { home, agentHome: join(home, ".pi", "agent"), env, pi: { command: "/fixture/pi", args: ["--host-flag"] }, resolveWorktree: () => undefined, sessionTransport: inertSessionTransport });
 			const { ctx } = fakeContext();
 			(ctx.sessionManager as unknown as { getCwd(): string }).getCwd = () => sessionCwd;
 			await h.fire("session_start", ctx);
 			shutdown.push(() => h.fire("session_shutdown", ctx));
-			return { h, ctx, result: withCanonicalGitFixture(() => h.tools.get("subagent_run")!.execute(`spawn-${mode}`, { agent: "explore", task: `Capture ${mode}`, mode }, undefined, undefined, ctx)) };
+			return { h, ctx, result: h.tools.get("subagent_run")!.execute(`spawn-${mode}`, { agent: "explore", task: `Capture ${mode}`, mode }, undefined, undefined, ctx) };
 		};
 		const task = await launch("task", { PATH: "/bin", FIXTURE: "task" });
 		await tick();
@@ -933,6 +1330,7 @@ test("default Node spawn adapter distinguishes IPC-only and permission-capable c
 
 		const args = ["--host-flag", "--mode", "rpc", "--session-dir", join(home, ".pi", "agent", "gentle-agents", "sessions"), "--model", "openai-codex/gpt-5.6-terra:low", "--tools", "read,grep,subagent_parent_message", "--append-system-prompt", "You map things."];
 		assert.equal(captured.length, 3, "the extension reaches Node's spawn boundary for IPC-only and permission-channel launches");
+		const permissionChannelStdio = process.platform === "win32" ? "overlapped" : "pipe";
 		for (const [index, fixture] of ["task", "background", "permission"].entries()) {
 			const permissionChannel = index === 2;
 			const ownedIpc = captured[index]?.options.env.GENTLE_PI_AGENTS_OWNED_IPC;
@@ -944,13 +1342,17 @@ test("default Node spawn adapter distinguishes IPC-only and permission-capable c
 			assert.equal(captured[index]?.options.shell, undefined, "the adapter does not invoke a shell");
 			assert.equal(captured[index]?.options.windowsHide, true, "the adapter always hides a Windows console");
 			assert.equal(captured[index]?.options.detached, process.platform !== "win32", "the adapter forwards the runner's platform selection");
-			assert.deepEqual(captured[index]?.options.stdio, permissionChannel ? ["pipe", "pipe", "pipe", "pipe", "ipc"] : ["pipe", "pipe", "pipe", "ipc"], permissionChannel ? "canonical repository children retain an fd3 permission channel and receive messaging IPC at fd4" : "IPC-only children have no inherited permission fd");
+			assert.deepEqual(captured[index]?.options.stdio, permissionChannel ? ["pipe", "pipe", "pipe", permissionChannelStdio, "ipc"] : ["pipe", "pipe", "pipe", "ipc"], permissionChannel ? "canonical repository children retain an fd3 permission channel and receive messaging IPC at fd4" : "IPC-only children have no inherited permission fd");
 		}
 		await Promise.all(shutdown.map((close) => close()));
 		assert.deepEqual(children[1]?.killed, ["SIGTERM"], "session shutdown cleans up an active background child");
 		shutdown.length = 0;
 	} finally {
-		await shutdownAndRestoreNativeSpawn(childProcess, originalSpawn, () => Promise.all(shutdown.map((close) => close())));
+		try {
+			await shutdownAndRestoreNativeSpawn(childProcess, originalSpawn, () => Promise.all(shutdown.map((close) => close())));
+		} finally {
+			rmSync(canonicalGitFixture, { recursive: true, force: true });
+		}
 	}
 });
 
@@ -975,7 +1377,7 @@ test("native spawn interception restores CommonJS and ESM exports after rejected
 				return undefined;
 			};
 		}
-		gentleAgents(h.pi, {}, { home, agentHome: join(home, ".pi", "agent"), env: { PATH: "/bin" }, pi: { command: "/fixture/pi", args: [] }, resolveWorktree: () => undefined });
+		gentleAgents(h.pi, {}, { home, agentHome: join(home, ".pi", "agent"), env: { PATH: "/bin" }, pi: { command: "/fixture/pi", args: [] }, resolveWorktree: () => undefined, sessionTransport: inertSessionTransport });
 		const { ctx } = fakeContext();
 		await h.fire("session_start", ctx);
 		await h.tools.get("subagent_run")!.execute("cleanup", { agent: "explore", task: "Keep cleanup live", mode: "background" }, undefined, undefined, ctx);
@@ -1155,16 +1557,16 @@ test("delayed child spawn retains the originating session and cannot append into
 
 test("agentRuntimePaths isolates sessions and transcripts by profile and retains the explicit-home fallback", () => {
 	assert.deepEqual(agentRuntimePaths("/home/x", "/profiles/pi-principal/agent"), {
-		sessions: "/profiles/pi-principal/agent/gentle-agents/sessions",
-		transcripts: "/profiles/pi-principal/agent/gentle-agents/transcripts",
+		sessions: join("/profiles/pi-principal/agent", "gentle-agents", "sessions"),
+		transcripts: join("/profiles/pi-principal/agent", "gentle-agents", "transcripts"),
 	});
 	assert.deepEqual(agentRuntimePaths("/home/x", "/profiles/pi-lab/agent"), {
-		sessions: "/profiles/pi-lab/agent/gentle-agents/sessions",
-		transcripts: "/profiles/pi-lab/agent/gentle-agents/transcripts",
+		sessions: join("/profiles/pi-lab/agent", "gentle-agents", "sessions"),
+		transcripts: join("/profiles/pi-lab/agent", "gentle-agents", "transcripts"),
 	});
 	assert.deepEqual(agentRuntimePaths("/home/x"), {
-		sessions: "/home/x/.pi/agent/gentle-agents/sessions",
-		transcripts: "/home/x/.pi/agent/gentle-agents/transcripts",
+		sessions: join("/home/x", ".pi", "agent", "gentle-agents", "sessions"),
+		transcripts: join("/home/x", ".pi", "agent", "gentle-agents", "transcripts"),
 	});
 });
 
@@ -1261,7 +1663,7 @@ test("subagent_list_agents and subagent_run in task mode launch a child with the
 	gentleAgents(pi, {}, harness.deps);
 	const { ctx, widget } = fakeContext();
 	await fire("session_start", ctx);
-	assert.deepEqual([...tools.keys()].sort(), ["subagent_cancel", "subagent_continue", "subagent_list_agents", "subagent_list_tasks", "subagent_reply", "subagent_result", "subagent_run", "subagent_send_message", "subagent_status"]);
+	assert.deepEqual([...tools.keys()].sort(), ["orchestrator_list", "orchestrator_send_message", "orchestrator_session_id", "subagent_cancel", "subagent_continue", "subagent_list_agents", "subagent_list_tasks", "subagent_reply", "subagent_result", "subagent_run", "subagent_send_message", "subagent_status"]);
 	const listed = await tools.get("subagent_list_agents")!.execute("c0", {}, undefined, undefined, ctx);
 	assert.match(listed.content[0].text, /- explore \(global\): maps things/);
 
@@ -1790,6 +2192,153 @@ test("the production overlay reads terminal rows at render time without a minimu
 	await opened;
 });
 
+
+test("default session transport selects Windows or POSIX classes without mutating the process platform", () => {
+	const registry = {} as never;
+	const onNotification = async () => {};
+	const windows = createDefaultSessionTransport("win32");
+	assert.ok(windows.createListener(registry, "s1", onNotification) instanceof WindowsActiveSessionListener);
+	assert.ok(windows.createClient(registry, "s1") instanceof WindowsActiveSessionClient);
+	const posix = createDefaultSessionTransport("linux");
+	assert.ok(posix.createListener(registry, "s1", onNotification) instanceof ActiveSessionListener);
+	assert.ok(posix.createClient(registry, "s1") instanceof ActiveSessionClient);
+	assert.equal(posix.createRegistry, createDefaultSessionTransport("darwin").createRegistry);
+	assert.equal(windows.createRegistry, createDefaultSessionTransport("win32").createRegistry);
+	assert.notEqual(windows.createRegistry, posix.createRegistry);
+});
+
+test("session transport startup failure cleans the constructed Windows-capable transport and stays unavailable", async () => {
+	const h = fakePi();
+	const runtime = deps();
+	let registryCloses = 0;
+	let listenerCloses = 0;
+	let clientCloses = 0;
+	const registry = {
+		list: async () => [],
+		listActivations: async () => [],
+		close: async () => { registryCloses += 1; },
+	};
+	const transport: SessionTransportFactory = {
+		createRegistry: async () => registry,
+		createListener: () => ({
+			registry,
+			start: async () => { throw new Error("unavailable"); },
+			close: async () => { listenerCloses += 1; },
+		}),
+		createClient: () => ({
+			close: () => { clientCloses += 1; },
+			sendNotification: async () => ({ id: "unused", accepted: true }),
+		}),
+	};
+	runtime.deps.sessionTransport = transport;
+	gentleAgents(h.pi, {}, runtime.deps);
+	const { ctx } = fakeContext();
+	await h.fire("session_start", ctx);
+	await eventually(() => clientCloses === 1 && listenerCloses === 1 && registryCloses === 1, "startup failure cleanup completes");
+	assert.equal(clientCloses, 1);
+	assert.equal(listenerCloses, 1);
+	assert.equal(registryCloses, 1);
+	assert.match((await h.tools.get("orchestrator_session_id")!.execute("id", {}, undefined, undefined, ctx)).content[0].text, /not ready/);
+});
+
+test("session transport adds host tools, forwards notifications, and closes on shutdown", async () => {
+	const h = fakePi();
+	const runtime = deps();
+	let callback: ((notification: { id: string; senderSessionId: string; message: string }) => Promise<void>) | undefined;
+	let listenerStarts = 0;
+	let listenerCloses = 0;
+	let clientCloses = 0;
+	const registry = { list: async () => [{ sessionId: "peer", reachability: "unknown" }], listActivations: async () => [] };
+	runtime.deps.sessionTransport = {
+		createRegistry: async () => registry,
+		createListener: (_registry, _sessionId, received) => {
+			callback = received;
+			return { registry, start: async () => { listenerStarts += 1; }, close: async () => { listenerCloses += 1; } };
+		},
+		createClient: () => ({ close: () => { clientCloses += 1; } }),
+	} as never;
+	gentleAgents(h.pi, {}, runtime.deps);
+	const { ctx } = fakeContext();
+	await h.fire("session_start", ctx);
+	await eventually(() => listenerStarts === 1, "session transport listener starts");
+	assert.equal(listenerStarts, 1);
+	assert.ok(h.tools.has("orchestrator_session_id"));
+	assert.ok(h.tools.has("orchestrator_list"));
+	assert.ok(h.tools.has("orchestrator_send_message"));
+	assert.match((await h.tools.get("orchestrator_list")!.execute("list", {}, undefined, undefined, ctx)).content[0].text, /peer/);
+	assert.ok(callback, "listener receives the inbound callback");
+	await callback!({ id: "message-1", senderSessionId: "peer", message: "\u001b[31mraw model content" });
+	assert.equal(h.sent.at(-1)?.message.customType, "gentle-agents.orchestrator-message");
+	assert.match(String(h.sent.at(-1)?.message.content), /\u001b\[31mraw model content/);
+	assert.deepEqual(h.sent.at(-1)?.options, { deliverAs: "followUp", triggerTurn: true });
+	await h.fire("session_shutdown", ctx);
+	assert.equal(clientCloses, 1);
+	assert.equal(listenerCloses, 1);
+});
+
+test("session transport accepts a notification while listener publication is still starting", async () => {
+	const h = fakePi();
+	const runtime = deps();
+	let callback: ((notification: { id: string; senderSessionId: string; message: string }) => Promise<void>) | undefined;
+	const registry = { list: async () => [], listActivations: async () => [] };
+	runtime.deps.sessionTransport = {
+		createRegistry: async () => registry,
+		createListener: (_registry, _sessionId, received) => {
+			callback = received;
+			return { registry, start: async () => { await callback!({ id: "published", senderSessionId: "peer", message: "during publication" }); }, close: async () => {} };
+		},
+		createClient: () => ({ close: () => {} }),
+	} as never;
+	gentleAgents(h.pi, {}, runtime.deps);
+	const { ctx } = fakeContext();
+	await h.fire("session_start", ctx);
+	await eventually(() => h.sent.at(-1)?.message.customType === "gentle-agents.orchestrator-message", "publication callback completes");
+	assert.equal(h.sent.at(-1)?.message.customType, "gentle-agents.orchestrator-message");
+	assert.match(String(h.sent.at(-1)?.message.content), /during publication/);
+});
+
+test("session transport selects a peer for outbound delivery and rejects stale callbacks after replacement", async () => {
+	const h = fakePi();
+	const runtime = deps();
+	const callbacks: Array<(notification: { id: string; senderSessionId: string; message: string }) => Promise<void>> = [];
+	const sent: Array<{ recipient: string; message: string; expectedActivation?: unknown }> = [];
+	let closed = 0;
+	const records = [
+		{ version: 1, sessionId: "alpha", endpoint: "/alpha.sock", createdAt: 1 },
+		{ version: 1, sessionId: "beta", endpoint: "/beta.sock", createdAt: 2 },
+	];
+	const registry = { list: async () => [], listActivations: async () => records };
+	runtime.deps.sessionTransport = {
+		createRegistry: async () => registry,
+		createListener: (_registry, _sessionId, received) => {
+			callbacks.push(received);
+			return { registry, start: async () => {}, close: async () => { closed += 1; } };
+		},
+		createClient: () => ({
+			close: () => { closed += 1; },
+			sendNotification: async (recipient: string, message: string, options: { expectedActivation?: unknown }) => {
+				sent.push({ recipient, message, expectedActivation: options.expectedActivation });
+				return { id: "accepted-1", accepted: true };
+			},
+		}),
+	} as never;
+	gentleAgents(h.pi, {}, runtime.deps);
+	const { ctx, dialogs } = fakeContext();
+	await h.fire("session_start", ctx);
+	await eventually(() => callbacks.length === 1, "initial transport callback registration");
+	const result = await h.tools.get("orchestrator_send_message")!.execute("send", { message: "hello peer" }, undefined, undefined, ctx);
+	assert.deepEqual(dialogs, ["select:Select recipient orchestrator:Orchestrator alpha|Orchestrator beta"]);
+	assert.deepEqual(sent, [{ recipient: "alpha", message: "hello peer", expectedActivation: records[0] }]);
+	assert.match(result.content[0].text, /accepted for delivery; it is not a delivery or read receipt/);
+	const original = callbacks[0]!;
+	(ctx.sessionManager as unknown as { getSessionId(): string }).getSessionId = () => "s2";
+	await h.fire("session_start", ctx);
+	await eventually(() => closed === 2, "replacement closes the old client and listener");
+	assert.equal(closed, 2, "replacement closes the old client and listener before activating its successor");
+	await assert.rejects(original({ id: "late", senderSessionId: "alpha", message: "late callback" }), /stale session transport/);
+	await h.fire("session_shutdown", ctx);
+});
+
 // Issue #867: a completion settling while the parent agent run is active must
 // be held by the extension and flushed at the next turn boundary, not parked
 // in the host's followUp queue until the whole orchestrator run stops calling
@@ -1930,6 +2479,7 @@ test("aborting the caller's signal cancels the subagent, records it, and says wh
 		"a warning names the abort and the cancellation",
 	);
 	assert.equal(harness.children[0].killed.length > 0, true, "the runner terminated the child");
+
 });
 
 test("selected child routes recheck provenance and keep separately authorized local tools", () => {
