@@ -3,6 +3,7 @@ import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { upsertAgentFrontmatterRouting } from "./agent-frontmatter.ts";
 import { resolveGentlePiAgentHome } from "./agent-home.ts";
 import type { SddArtifactStore } from "./sdd-status.ts";
 
@@ -404,35 +405,12 @@ function readLegacyManagedAssetHashes(): Record<string, readonly string[]> {
 	return hashes;
 }
 
-function updateAgentFrontmatterRouting(
-	content: string,
-	routingLines: readonly string[],
-): string {
-	if (!content.startsWith("---\n")) return content;
-	const endIndex = content.indexOf("\n---", 4);
-	if (endIndex === -1) return content;
-	const frontmatter = content.slice(4, endIndex);
-	const body = content.slice(endIndex);
-	const lines = frontmatter
-		.split("\n")
-		.filter((line) => !/^(?:model|thinking):/.test(line));
-	if (routingLines.length > 0) {
-		const descriptionIndex = lines.findIndex((line) =>
-			line.startsWith("description:"),
-		);
-		const insertIndex =
-			descriptionIndex >= 0 ? descriptionIndex + 1 : Math.min(1, lines.length);
-		lines.splice(insertIndex, 0, ...routingLines);
-	}
-	return `---\n${lines.join("\n")}${body}`;
-}
-
 function legacyComparableAssetContent(
 	ownershipKey: string,
 	content: string,
 ): string {
 	return ownershipKey.startsWith("agents/")
-		? updateAgentFrontmatterRouting(content, [])
+		? upsertAgentFrontmatterRouting(content, [])
 		: content;
 }
 
@@ -449,7 +427,7 @@ function migrateLegacyAssetContent(
 		.slice(4, endIndex)
 		.split("\n")
 		.filter((line) => /^(?:model|thinking):/.test(line));
-	return updateAgentFrontmatterRouting(packagedContent, routingLines);
+	return upsertAgentFrontmatterRouting(packagedContent, routingLines);
 }
 
 function replaceManagedAssetFileAtomically(path: string, content: string): void {
