@@ -27,16 +27,19 @@ The rail reuses its last frame until something it paints changes, so silent fram
 
 The sidebar Status card also shows `Profile` in its Model section when the profiles store has a valid active marker. It follows profile changes on the next render. Missing, unreadable, or invalid stores leave the line hidden. The compact bottom bar is unchanged.
 
-The status bar replaces pi's three-line footer with a single line of segments:
+The status bar replaces pi's three-line footer with a responsive one-to-three-line layout:
 
 ```text
-✿ gentle-pi ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium ⟡ ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub ⟡ MCP: 3 servers enabled        Release notes
+✿ gentle-pi ⟡ gentle-pi main                                               Release notes
+gpt-5.5 · medium ⟡ ctx ▰▰▱▱▱ 45% ⟡ $9.49 sub ⟡ codex 5h ▰▰▰▱▱ 62%
+🔌 MCP: 3 servers enabled
 ```
 
+- The project and session share the first line; model, context, cost, and provider usage share the runtime line; integration statuses use a third line when needed.
 - Context is a gauge, not a number. It turns amber at 80% and red at 95%; after compaction it shows `?%` until the next response.
 - Cost carries `sub` when the active model runs on a subscription login.
-- Statuses other extensions publish through `setStatus` are appended as trailing segments; the session name sits at the right edge.
-- On narrow terminals the session name is dropped first, then trailing segments, before the line is truncated.
+- On compact terminals, gauges degrade from 5 cells to 2 to percentage-only; rightmost provider usage compacts before context.
+- Overflow is summarized as `+N more` or `+N integrations`; the session stays on the project line, clipping there before omission.
 
 The prompt wraps pi's editor in a rounded frame with a petal that shows what the agent is doing:
 
@@ -84,10 +87,11 @@ The separate `session_worktree_register` tool still registers canonical same-clo
 - `GENTLE_PI_SHELL_CHANGES_KEY` rebinds the shortcut; `off` disables it. `GENTLE_PI_SHELL_CHANGES_POLL_MS` controls only the open overlay's in-memory refresh. `GENTLE_PI_SHELL_CHANGES_WATCH_MS` no longer enables filesystem polling.
 - No captured changes means no widget and an informational notice; it does not assert that the working tree is clean.
 
-Subscription usage shows in the bar after the cost, and `/gentle:usage` opens a panel with every window per provider:
+Subscription usage appears after the cost on the runtime line when space allows, and `/gentle:usage` opens a panel with every window per provider:
 
 ```text
-✿ gentle-pi ⟡ … ⟡ $9.49 sub ⟡ codex 5h ▰▰▰▰▰▱▱▱ 62% · week 31%
+✿ gentle-pi ⟡ …
+… ⟡ $9.49 sub ⟡ codex 5h ▰▰▰▱▱ 62% · week 31%
 ```
 
 - For Codex, usage comes from the same account usage endpoint the Codex CLI reads, using the OAuth token pi already holds. It is fetched at session start, at most every 5 minutes after a turn, and on `r` in the panel. Rate-limit headers on SSE responses are picked up too.

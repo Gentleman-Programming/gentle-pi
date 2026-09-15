@@ -6,9 +6,9 @@ import { CARD_TONE, cardInnerWidth, renderCard } from "./shell-card.ts";
 
 export { gaugeTone, renderGauge, type GaugeTone };
 
-// Gentle Shell status bar: one line of segments that replaces pi's built-in
-// three-line footer. Everything here is pure so the bar can be rendered and
-// verified without a live TUI.
+// Gentle Shell status bar: a responsive one-to-three-line replacement for
+// pi's built-in footer. Everything here is pure so it can be verified without
+// a live TUI.
 
 export interface ShellBarModel {
 	profile?: string;
@@ -72,50 +72,130 @@ export function formatCost(total: number, subscription: boolean): string {
 	return subscription ? `$${amount} sub` : `$${amount}`;
 }
 
-// Extensions may paint their status themselves (pi-mcp-adapter does); the bar
-// owns the palette, so their escapes go and the text takes the status role.
-function sanitizeStatus(text: string): string {
+// External values may contain terminal control sequences or line breaks. Keep
+// each field to one safe display line before applying the bar's own palette.
+function sanitizeBarText(text: string): string {
 	return sanitizeTerminalText(text.replace(/[\r\n\t]/g, " ")).replace(/ +/g, " ").trim();
 }
 
-function buildSegments(model: ShellBarModel, theme: ShellBarTheme): string[] {
-	const dirty = model.dirty ? ` ${theme.fg(ROLE.DIRTY, `±${model.dirty}`)}` : "";
-	const location = model.branch
-		? `${theme.fg(ROLE.PATH, model.cwd)} ${theme.fg(ROLE.BRANCH, model.branch)}${dirty}`
-		: theme.fg(ROLE.PATH, model.cwd) + dirty;
-	const modelSegment = model.effort
-		? `${theme.fg(ROLE.MODEL, model.modelId)} ${theme.fg(ROLE.LABEL, "·")} ${theme.fg(ROLE.EFFORT, model.effort)}`
-		: theme.fg(ROLE.MODEL, model.modelId);
-	const percentText = model.contextPercent === null ? "?%" : `${Math.round(model.contextPercent)}%`;
-	const context = `${theme.fg(ROLE.LABEL, "ctx")} ${paintGauge(model.contextPercent, theme)} ${theme.fg(ROLE.VALUE, percentText)}`;
-	const cost = theme.fg(ROLE.VALUE, formatCost(model.costTotal, model.subscription));
-	const usage = model.usage ? renderUsageBar(model.usage, theme) : undefined;
-	const statuses = model.statuses.map((status) => theme.fg(ROLE.STATUS, sanitizeStatus(status)));
-	return [theme.fg(ROLE.BRAND, SHELL_BAR_BRAND), location, modelSegment, context, cost, ...(usage ? [usage] : []), ...statuses];
+interface ShellBarFields {
+	brand: string;
+	project: string;
+	compactProject: string;
+	model: string;
+	compactModel: string;
+	context: string[];
+	cost: string;
+	usage?: [full: string, compact: string, percentOnly: string];
+	statuses: string[];
+	session?: string;
 }
 
-// When the line overflows, the location gives way first: the path shrinks to
-// its last segment and a long branch is clipped, so the trailing statuses
-// (MCP servers, extension notices) survive on ordinary terminal widths.
-function compactModel(model: ShellBarModel): ShellBarModel {
-	const cwd = model.cwd.split("/").filter((part) => part.length > 0).pop() ?? model.cwd;
-	const branch = model.branch && visibleWidth(model.branch) > COMPACT_BRANCH_WIDTH ? clipText(model.branch, COMPACT_BRANCH_WIDTH) : model.branch;
-	return { ...model, cwd, branch };
-}
-
-// Plain clip: pi's truncateToWidth wraps the result in resets, which would end
-// up inside a painted segment.
 function clipText(text: string, max: number): string {
-	let clipped = "";
-	for (const char of text) {
-		if (visibleWidth(clipped + char) > max - 1) break;
-		clipped += char;
-	}
-	return `${clipped}…`;
+	return truncateToWidth(text, max, "…");
 }
 
 function joinSegments(segments: string[], theme: ShellBarTheme): string {
-	return segments.join(` ${theme.fg(ROLE.SEPARATOR, SHELL_BAR_SEPARATOR)} `);
+	return segments.filter(Boolean).join(` ${theme.fg(ROLE.SEPARATOR, SHELL_BAR_SEPARATOR)} `);
+}
+
+function buildFields(model: ShellBarModel, theme: ShellBarTheme): ShellBarFields {
+	const projectCwd = sanitizeBarText(model.cwd);
+	const projectBranch = model.branch ? sanitizeBarText(model.branch) : null;
+	const modelId = sanitizeBarText(model.modelId);
+	const effort = model.effort ? sanitizeBarText(model.effort) : undefined;
+	const sessionName = model.sessionName ? sanitizeBarText(model.sessionName) : undefined;
+	const project = (cwd: string, branch: string | null) => {
+		const dirty = model.dirty ? ` ${theme.fg(ROLE.DIRTY, `±${model.dirty}`)}` : "";
+		return branch ? `${theme.fg(ROLE.PATH, cwd)} ${theme.fg(ROLE.BRANCH, branch)}${dirty}` : theme.fg(ROLE.PATH, cwd) + dirty;
+	};
+	const cwd = projectCwd.split("/").filter(Boolean).pop() ?? projectCwd;
+	const branch = projectBranch && visibleWidth(projectBranch) > COMPACT_BRANCH_WIDTH ? clipText(projectBranch, COMPACT_BRANCH_WIDTH) : projectBranch;
+	const percent = model.contextPercent === null ? "?%" : `${Math.round(model.contextPercent)}%`;
+	const context = (cells?: number) => `${theme.fg(ROLE.LABEL, "ctx")}${cells ? ` ${paintGauge(model.contextPercent, theme, cells)}` : ""} ${theme.fg(ROLE.VALUE, percent)}`;
+	const main = model.usage?.limits[0];
+	const [firstWindow, ...otherWindows] = main?.windows ?? [];
+	const usage = main && firstWindow
+		? ([5, 2, undefined] as const).map((cells) => {
+			const gauge = cells ? ` ${paintGauge(firstWindow.usedPercent, theme, cells)}` : "";
+			const head = `${theme.fg(ROLE.LABEL, main.name)} ${theme.fg(ROLE.LABEL, firstWindow.label)}${gauge} ${theme.fg(ROLE.VALUE, `${Math.round(firstWindow.usedPercent)}%`)}`;
+			const tail = otherWindows.map((window) => `${theme.fg(ROLE.SEPARATOR, "·")} ${theme.fg(ROLE.LABEL, window.label)} ${theme.fg(ROLE.VALUE, `${Math.round(window.usedPercent)}%`)}`);
+			return [head, ...tail].join(" ");
+		}) as [string, string, string]
+		: undefined;
+	return {
+		brand: theme.fg(ROLE.BRAND, SHELL_BAR_BRAND),
+		project: project(cwd, projectBranch),
+		compactProject: project(cwd, branch),
+		model: effort ? `${theme.fg(ROLE.MODEL, modelId)} ${theme.fg(ROLE.LABEL, "·")} ${theme.fg(ROLE.EFFORT, effort)}` : theme.fg(ROLE.MODEL, modelId),
+		compactModel: theme.fg(ROLE.MODEL, modelId),
+		context: [context(5), context(2), context()],
+		cost: theme.fg(ROLE.VALUE, formatCost(model.costTotal, model.subscription)),
+		usage,
+		statuses: model.statuses.map(sanitizeBarText).filter(Boolean).map((status) => theme.fg(ROLE.STATUS, status)),
+		session: sessionName ? theme.fg(ROLE.SESSION, sessionName) : undefined,
+	};
+}
+
+function fitLine(line: string, width: number): string {
+	return visibleWidth(line) <= width ? line : truncateToWidth(line, width, "…");
+}
+
+function projectLine(fields: ShellBarFields, theme: ShellBarTheme, width: number): string {
+	const left = [fields.project, fields.compactProject].find((candidate) => visibleWidth(joinSegments([fields.brand, candidate], theme)) <= width);
+	const identity = joinSegments([fields.brand, left ?? fields.compactProject], theme);
+	if (!fields.session || visibleWidth(identity) + RIGHT_PADDING >= width) return fitLine(identity, width);
+	const sessionWidth = width - visibleWidth(identity) - RIGHT_PADDING;
+	const session = fitLine(fields.session, sessionWidth);
+	return `${identity}${" ".repeat(Math.max(RIGHT_PADDING, width - visibleWidth(identity) - visibleWidth(session)))}${session}`;
+}
+
+interface RuntimeLine {
+	line: string;
+	includesUsage: boolean;
+	includesCost: boolean;
+}
+
+interface SemanticEntry {
+	text: string;
+	omissionClass: "runtime" | "integration";
+}
+
+function runtimeLine(fields: ShellBarFields, theme: ShellBarTheme, width: number, includeUsage: boolean): RuntimeLine {
+	const candidates = includeUsage && fields.usage
+		? [
+			{ context: fields.context[0], usage: fields.usage[0] },
+			{ context: fields.context[0], usage: fields.usage[1] },
+			{ context: fields.context[0], usage: fields.usage[2] },
+			{ context: fields.context[1], usage: fields.usage[2] },
+			{ context: fields.context[2], usage: fields.usage[2] },
+		]
+		: fields.context.map((context) => ({ context, usage: undefined }));
+	for (const model of [fields.model, fields.compactModel]) {
+		for (const candidate of candidates) {
+			const line = joinSegments([model, candidate.context, fields.cost, candidate.usage ?? ""], theme);
+			if (visibleWidth(line) <= width) return { line, includesUsage: Boolean(candidate.usage), includesCost: true };
+		}
+	}
+	return { line: fitLine(joinSegments([fields.compactModel, fields.context[2]], theme), width), includesUsage: false, includesCost: false };
+}
+
+function semanticLine(entries: SemanticEntry[], theme: ShellBarTheme, width: number): string {
+	for (let count = entries.length; count >= 0; count--) {
+		const admitted = entries.slice(0, count);
+		const omitted = entries.slice(count);
+		const runtimeOmitted = omitted.some((entry) => entry.omissionClass === "runtime");
+		const integrationsOmitted = omitted.filter((entry) => entry.omissionClass === "integration").length;
+		const indicators = [
+			runtimeOmitted ? theme.fg(ROLE.STATUS, "r!") : "",
+			integrationsOmitted ? theme.fg(ROLE.STATUS, admitted.some((entry) => entry.omissionClass === "integration") ? `+${integrationsOmitted} more` : `+${integrationsOmitted} integrations`) : "",
+		];
+		const line = joinSegments([...admitted.map((entry) => entry.text), ...indicators], theme);
+		if (line && visibleWidth(line) <= width) return line;
+	}
+	const hasRuntime = entries.some((entry) => entry.omissionClass === "runtime");
+	const hasIntegrations = entries.some((entry) => entry.omissionClass === "integration");
+	return [hasRuntime ? theme.fg(ROLE.STATUS, "r!") : "", hasIntegrations ? theme.fg(ROLE.STATUS, "i!") : ""].filter(Boolean).join(" ");
 }
 
 // Sidebar groups use structured fields, never positional compact-bar segments
@@ -124,7 +204,12 @@ export function renderShellSidebarBar(model: ShellBarModel, theme: ShellBarTheme
 	const value = (text: string) => theme.fg(ROLE.VALUE, theme.bold(text));
 	const label = (text: string) => theme.fg(ROLE.LABEL, text);
 	const dirty = model.dirty ? theme.fg(ROLE.DIRTY, `±${model.dirty}`) : "";
-	const branch = model.branch ? `${label("Branch")} ${value(model.branch)}` : "";
+	const cwd = sanitizeBarText(model.cwd);
+	const branchName = model.branch ? sanitizeBarText(model.branch) : "";
+	const modelId = sanitizeBarText(model.modelId);
+	const effort = model.effort ? sanitizeBarText(model.effort) : "";
+	const sessionName = model.sessionName ? sanitizeBarText(model.sessionName) : "";
+	const branch = branchName ? `${label("Branch")} ${value(branchName)}` : "";
 	const percent = model.contextPercent === null ? "?%" : `${Math.round(model.contextPercent)}%`;
 	const capacity = label(`${formatTokens(model.contextWindow)} tokens`);
 	const usage = model.usage ? renderUsageBar(model.usage, theme) : undefined;
@@ -132,17 +217,17 @@ export function renderShellSidebarBar(model: ShellBarModel, theme: ShellBarTheme
 		{
 			title: "Project",
 			lines: [
-				value(model.cwd),
+				value(cwd),
 				...((branch || dirty) ? [[branch, dirty].filter(Boolean).join(" ")] : []),
-				...(model.sessionName ? [`${label("Session")} ${value(model.sessionName)}`] : []),
+				...(sessionName ? [`${label("Session")} ${value(sessionName)}`] : []),
 			],
 		},
 		{
 			title: "Model",
 			lines: [
-				value(model.modelId),
-				...(model.effort ? [`${label("Effort")} ${theme.fg(ROLE.EFFORT, model.effort)}`] : []),
-				...(model.profile ? [`${label("Profile")} ${value(sanitizeStatus(model.profile))}`] : []),
+				value(modelId),
+				...(effort ? [`${label("Effort")} ${theme.fg(ROLE.EFFORT, effort)}`] : []),
+				...(model.profile ? [`${label("Profile")} ${value(sanitizeBarText(model.profile))}`] : []),
 			],
 		},
 		{
@@ -153,7 +238,7 @@ export function renderShellSidebarBar(model: ShellBarModel, theme: ShellBarTheme
 			title: "Usage",
 			lines: [`${label("Cost")} ${value(formatCost(model.costTotal, model.subscription))}`, ...(usage ? [usage] : [])],
 		},
-		...(model.statuses.length ? [{ title: "Integrations", lines: model.statuses.map((status) => theme.fg(ROLE.STATUS, sanitizeStatus(status))) }] : []),
+		...(model.statuses.length ? [{ title: "Integrations", lines: model.statuses.map(sanitizeBarText).filter(Boolean).map((status) => theme.fg(ROLE.STATUS, status)) }] : []),
 	];
 	// Pre-wrap values before indenting so Unicode/ANSI continuation lines keep
 	// the same inset without consuming the card's right border.
@@ -168,22 +253,50 @@ export function renderShellSidebarBar(model: ShellBarModel, theme: ShellBarTheme
 }
 
 export function renderShellBar(model: ShellBarModel, theme: ShellBarTheme, width: number): string[] {
-	let segments = buildSegments(model, theme);
-	const right = model.sessionName ? theme.fg(ROLE.SESSION, model.sessionName) : undefined;
-
-	let left = joinSegments(segments, theme);
-	if (right && visibleWidth(left) + RIGHT_PADDING + visibleWidth(right) <= width) {
-		const padding = " ".repeat(width - visibleWidth(left) - visibleWidth(right));
-		return [left + padding + right];
+	const fields = buildFields(model, theme);
+	if (width <= 0) return [];
+	if (width < 5) {
+		const status = fields.statuses.find((candidate) => visibleWidth(candidate) <= width);
+		return status ? [fitLine("!", width), fitLine("r!", width), status] : [fitLine("!", width), fitLine("r!", width)];
+	}
+	const complete = joinSegments([fields.brand, fields.project, fields.model, fields.context[0], fields.cost, fields.usage?.[0] ?? "", ...fields.statuses], theme);
+	if (visibleWidth(complete) + (fields.session ? RIGHT_PADDING + visibleWidth(fields.session) : 0) <= width) {
+		const padding = fields.session ? " ".repeat(width - visibleWidth(complete) - visibleWidth(fields.session)) : "";
+		return [complete + padding + (fields.session ?? "")];
 	}
 
-	if (visibleWidth(left) > width) {
-		segments = buildSegments(compactModel(model), theme);
-		left = joinSegments(segments, theme);
+	if (width === 5) {
+		const runtimeOmitted = Boolean(fields.usage);
+		const status = fields.statuses.find((candidate) => visibleWidth(candidate) <= width);
+		if (status) return [fitLine("!", width), runtimeOmitted ? theme.fg(ROLE.STATUS, "r!") : fitLine("!", width), status];
+		const integrationsOmitted = fields.statuses.length > 0;
+		const indicators = [
+			runtimeOmitted ? theme.fg(ROLE.STATUS, "r!") : "",
+			integrationsOmitted ? theme.fg(ROLE.STATUS, "i!") : "",
+		].filter(Boolean).join(" ");
+		return [indicators || fitLine("!", width)];
 	}
-	while (segments.length > 1 && visibleWidth(left) > width) {
-		segments.pop();
-		left = joinSegments(segments, theme);
+
+	const first = projectLine(fields, theme, width);
+	const secondWithUsage = runtimeLine(fields, theme, width, true);
+	const second = secondWithUsage.includesUsage ? secondWithUsage : runtimeLine(fields, theme, width, false);
+	if (!second.includesCost && !fields.usage && fields.statuses.length === 1 && visibleWidth(fields.statuses[0]) <= width) {
+		return [first, theme.fg(ROLE.STATUS, "r!"), fields.statuses[0]].map((line) => fitLine(line, width));
 	}
-	return [truncateToWidth(left, width, "…")];
+	const entries: SemanticEntry[] = [
+		...(!second.includesCost ? [{ text: fields.cost, omissionClass: "runtime" as const }] : []),
+		...(!second.includesUsage && fields.usage ? [{ text: fields.usage[2], omissionClass: "runtime" as const }] : []),
+		...fields.statuses.map((text) => ({ text, omissionClass: "integration" as const })),
+	];
+	if (entries.length === 0) return [first, second.line];
+	const third = semanticLine(entries, theme, width);
+	const runtimeOmitted = entries.some((entry) => entry.omissionClass === "runtime");
+	const integrationEntries = entries.filter((entry) => entry.omissionClass === "integration");
+	const integrationsOnly = integrationEntries.length ? semanticLine(integrationEntries, theme, width) : "";
+	const integrationFallback = integrationEntries.length ? theme.fg(ROLE.STATUS, `+${integrationEntries.length} integrations`) : "";
+	const runtimeIndicator = theme.fg(ROLE.STATUS, "r!");
+	if (runtimeOmitted && integrationsOnly === integrationFallback && visibleWidth(joinSegments([runtimeIndicator, integrationFallback], theme)) > width) {
+		return [first, runtimeIndicator, integrationsOnly].map((line) => fitLine(line, width));
+	}
+	return [first, second.line, third].filter(Boolean).map((line) => fitLine(line, width));
 }
