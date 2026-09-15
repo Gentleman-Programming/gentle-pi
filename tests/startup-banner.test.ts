@@ -127,14 +127,28 @@ for (const showRose of [false, true]) for (const showTextLogo of [false, true]) 
 
 // The banner's MCP stat counted every key in the GLOBAL config file, so a
 // server that connects to nothing still inflated it and a project-only server
-// never appeared (#979).
-const mcpLayers = (cwd: string, layers: Record<string, unknown>) => {
-	const [global, project] = mcpConfigPaths(cwd);
-	// Control: the two layers really are two distinct paths, or every case
-	// below would be measuring one file twice.
-	assert.notEqual(global, project);
+// never appeared (#979). It also read only the two Pi-owned files, while the
+// session merges six layers, so a server defined in a shared layer was missing
+// and an omitted higher-precedence `disabled` entry kept one in the count.
+const MCP_LAYER_NAMES = [
+	"sharedGlobal",
+	"agentsGlobal",
+	"agentsNested",
+	"global",
+	"projectShared",
+	"project",
+] as const;
+
+const mcpLayers = (cwd: string, layers: Partial<Record<(typeof MCP_LAYER_NAMES)[number], unknown>>) => {
+	const paths = mcpConfigPaths(cwd);
+	// Control: the layers really are distinct paths, or every case below would
+	// be measuring one file several times over.
+	assert.equal(paths.length, MCP_LAYER_NAMES.length);
+	assert.equal(new Set(paths).size, paths.length);
+	const byPath = new Map(paths.map((path, index) => [path, MCP_LAYER_NAMES[index]!]));
 	return async (path: string) => {
-		const body = path === global ? layers.global : path === project ? layers.project : undefined;
+		const name = byPath.get(path);
+		const body = name === undefined ? undefined : layers[name];
 		if (body === undefined) throw new Error(`ENOENT: ${path}`);
 		return typeof body === "string" ? body : JSON.stringify(body);
 	};
@@ -156,23 +170,51 @@ test("MCP stat sees a project layer, and lets it disable a globally enabled serv
 	assert.equal(await countEnabledMcpServers("/repo", read), 1);
 });
 
-test("MCP stat keeps the layers it can read when another is missing or malformed", async () => {
-	const twoEnabled = { mcpServers: { one: { command: "a" }, two: { command: "b" } } };
-	// Missing project layer.
-	assert.equal(await countEnabledMcpServers("/repo", mcpLayers("/repo", { global: twoEnabled })), 2);
-	// Unparseable global layer, readable project layer.
-	assert.equal(await countEnabledMcpServers("/repo", mcpLayers("/repo", {
-		global: "{ not json",
-		project: { mcpServers: { only: { command: "c" } } },
-	})), 1);
-	// Nothing readable at all is zero, not a crash.
-	assert.equal(await countEnabledMcpServers("/repo", mcpLayers("/repo", {})), 0);
+test("MCP stat reads the shared layers the session merges, not only the Pi-owned two", async () => {
+	// One server per shared layer, none of them in a Pi-owned file. Reading only
+	// `~/.pi/agent/mcp.json` and `<cwd>/.pi/mcp.json` reported none of them.
+	const read = mcpLayers("/repo", {
+		sharedGlobal: { mcpServers: { a: { command: "a" } } },
+		agentsGlobal: { mcpServers: { b: { command: "b" } } },
+		agentsNested: { mcpServers: { c: { command: "c" } } },
+		projectShared: { mcpServers: { d: { command: "d" } } },
+	});
+	assert.equal(await countEnabledMcpServers("/repo", read), 4);
+});
+
+test("MCP stat lets a higher layer disable a server a lower one enabled", async () => {
+	// The direction the old two-path read could not see: `.mcp.json` sits ABOVE
+	// the Pi global file, so its `disabled` wins and the banner must not keep
+	// counting the server the global layer enabled.
+	const read = mcpLayers("/repo", {
+		sharedGlobal: { mcpServers: { shared: { command: "a" } } },
+		projectShared: { mcpServers: { shared: { command: "a", disabled: true } } },
+	});
+	assert.equal(await countEnabledMcpServers("/repo", read), 0);
+});
+
+test("MCP stat reads the mcp-servers spelling the adapter also accepts", async () => {
+	const read = mcpLayers("/repo", {
+		global: { "mcp-servers": { one: { command: "a" } } },
+	});
+	assert.equal(await countEnabledMcpServers("/repo", read), 1);
 });
 
 test("MCP stat tolerates a config whose mcpServers is not an object of entries", async () => {
-	for (const shape of [{ mcpServers: [] }, { mcpServers: null }, {}, "null", { mcpServers: { one: null } }]) {
-		const expected = shape !== null && typeof shape === "object"
-			&& "mcpServers" in shape && shape.mcpServers !== null && !Array.isArray(shape.mcpServers) ? 1 : 0;
+	// An entry that is not a non-null object is not a server definition: the
+	// adapter's `isRecord` drops it before the session sees it, so counting it
+	// as enabled reported a server that never loads.
+	const shapes: [unknown, number][] = [
+		[{ mcpServers: [] }, 0],
+		[{ mcpServers: null }, 0],
+		[{}, 0],
+		["null", 0],
+		[{ mcpServers: { one: null } }, 0],
+		[{ mcpServers: { one: "a" } }, 0],
+		[{ mcpServers: { one: [] } }, 0],
+		[{ mcpServers: { one: { command: "a" }, two: null } }, 1],
+	];
+	for (const [shape, expected] of shapes) {
 		assert.equal(
 			await countEnabledMcpServers("/repo", mcpLayers("/repo", { global: shape })),
 			expected,

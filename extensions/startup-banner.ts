@@ -530,14 +530,41 @@ interface McpServerEntry {
 }
 
 interface McpConfigFile {
-  mcpServers?: Record<string, McpServerEntry | null>;
+  mcpServers?: unknown;
+  "mcp-servers"?: unknown;
 }
 
-/** MCP config layers, lowest precedence first. A project layer replaces the
- *  global entry for a server of the same name, which is how `/mcp disable`
- *  turns a globally configured server off for one project. */
+/** MCP config layers, lowest precedence first, as `getConfigSources` in
+ *  pi-mcp-adapter orders them (verified against 2.34.0). A later layer replaces
+ *  the earlier entry for a server of the same name, which is how `/mcp disable`
+ *  turns a globally configured server off for one project.
+ *
+ *  Reading only the two Pi-owned files missed a server defined in a shared
+ *  layer entirely, and let an omitted higher-precedence `disabled` entry keep a
+ *  server in the count that the session does not load.
+ *
+ *  Four adapter sources are deliberately NOT mirrored, because none of them can
+ *  be resolved from a config path alone: exclusive-config mode, opt-in host and
+ *  ancestor discovery, and the package / agent-plugin / Claude-plugin configs.
+ *  A banner that walks those would be a second implementation of the loader
+ *  rather than a reading of it. */
 export function mcpConfigPaths(cwd: string): string[] {
-  return [join(PI_AGENT_DIR, "mcp.json"), join(cwd, ".pi", "mcp.json")];
+  const home = os.homedir();
+  return [
+    join(home, ".config", "mcp", "mcp.json"),
+    join(home, ".agents", "mcp.json"),
+    join(home, ".agents", "mcp", "mcp.json"),
+    join(PI_AGENT_DIR, "mcp.json"),
+    join(cwd, ".mcp.json"),
+    join(cwd, ".pi", "mcp.json"),
+  ];
+}
+
+/** The adapter's own entry test (`isRecord` in its `config.ts`): a null, a
+ *  primitive or an array is not a server definition and never reaches the
+ *  session, so it must not reach the count either. */
+function isMcpServerEntry(value: unknown): value is McpServerEntry {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /** How many MCP servers this session actually loads.
@@ -554,15 +581,18 @@ export async function countEnabledMcpServers(
 ): Promise<number> {
   const servers = new Map<string, McpServerEntry>();
   for (const path of mcpConfigPaths(cwd)) {
-    let entries: McpConfigFile["mcpServers"];
+    let entries: unknown;
     try {
-      entries = (JSON.parse(await read(path)) as McpConfigFile | null)?.mcpServers;
+      const file = JSON.parse(await read(path)) as McpConfigFile | null;
+      // `mcp-servers` is the alias the adapter reads alongside `mcpServers`.
+      entries = file?.mcpServers ?? file?.["mcp-servers"];
     } catch {
       continue;
     }
-    if (!entries || typeof entries !== "object" || Array.isArray(entries)) continue;
+    if (!isMcpServerEntry(entries)) continue;
     for (const [name, entry] of Object.entries(entries)) {
-      servers.set(name, entry ?? {});
+      if (!isMcpServerEntry(entry)) continue;
+      servers.set(name, entry);
     }
   }
   let enabled = 0;
