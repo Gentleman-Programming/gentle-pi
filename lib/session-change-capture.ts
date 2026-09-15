@@ -26,7 +26,7 @@ export function installSessionChangeCapture(pi: ExtensionAPI, env: NodeJS.Proces
 		pending.clear(); current = ctx;
 		store = new SessionChanges(ctx.sessionManager.getSessionId(), ctx.sessionManager.getEntries());
 	});
-	const off = pi.events.on(SESSION_CHANGE_RELAY, (value) => {
+	pi.events.on(SESSION_CHANGE_RELAY, (value) => {
 		const data = value as { sessionId?: string; evidence?: unknown };
 		if (child || !current || data?.sessionId !== current.sessionManager.getSessionId() || !isSessionChangeEvidence(data.evidence)) return;
 		try {
@@ -83,5 +83,5 @@ export function installSessionChangeCapture(pi: ExtensionAPI, env: NodeJS.Proces
 			try { publish(item.evidence); } catch { /* Preserve the tool's outcome. */ }
 		}
 	});
-	pi.on("session_shutdown", () => { pending.clear(); current = undefined; store = undefined; off(); });
+	pi.on("session_shutdown", () => { pending.clear(); current = undefined; store = undefined; });
 }

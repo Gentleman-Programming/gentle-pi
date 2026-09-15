@@ -11,6 +11,7 @@ import { CHANGE_STATUS } from "../lib/shell-changes.ts";
 import { sidebarState, type SidebarRail } from "../lib/shell-sidebar.ts";
 import type { ShellBarTheme } from "../lib/shell-bar.ts";
 import { stripAnsi } from "../lib/terminal-theme.ts";
+import type { NativeReviewModeResult } from "../lib/native-review-cli.ts";
 
 // The Gentle Shell extension wires the pure bar renderer into pi's footer
 // slot. These tests drive it with a fake ExtensionAPI and context.
@@ -102,7 +103,7 @@ function fakePi(script: GitScript[] = [{ numstat: "", porcelain: "" }]) {
 			return { stdout: isNumstat ? step.numstat : step.porcelain, stderr: "", code: 0, killed: false };
 		},
 	} as unknown as ExtensionAPI;
-	return { pi, handlers, git, commands, shortcuts, tools };
+	return { pi, handlers, git, commands, shortcuts, tools, listeners };
 }
 
 async function fire(handlers: Map<string, Array<(event: unknown, ctx: ExtensionContext) => unknown>>, event: string, ctx: ExtensionContext): Promise<void> {
@@ -228,6 +229,126 @@ test("gentleShell installs the footer on session_start when a UI exists", () => 
 	const lines = component.render(120);
 	assert.equal(lines.length, 1);
 	assert.match(lines[0], /main ⟡ gpt-5\.5 · medium/);
+});
+
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<T>((resolvePromise, rejectPromise) => { resolve = resolvePromise; reject = rejectPromise; });
+	return { promise, resolve, reject };
+}
+
+function modeResult(effective: "on" | "off", scope: "global" | "clone" | "both" = "clone"): NativeReviewModeResult {
+	return { operation: "status" as const, scope, status: { global: "", cloneLocal: "", effective, source: "default" as const } };
+}
+
+test("RDD lifecycle starts unknown, reads status once outside render, and updates only after resolution", async () => {
+	const reads: Array<{ request: { operation: string }; result: ReturnType<typeof deferred<ReturnType<typeof modeResult>> > }> = [];
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { rddModeReader: { reviewMode(request) {
+		const result = deferred<ReturnType<typeof modeResult>>();
+		reads.push({ request, result });
+		return result.promise;
+	} } });
+	const { ctx, ui } = fakeContext();
+	(ctx as unknown as { cwd: string }).cwd = "/rdd-lifecycle";
+	(ctx.sessionManager as unknown as { getCwd(): string }).getCwd = () => "/rdd-lifecycle";
+	await fire(handlers, "session_start", ctx);
+	assert.equal(reads.length, 1);
+	assert.equal(reads[0]!.request.operation, "status");
+	assert.match(renderFooter(ui), /RDD: \?/);
+	renderFooter(ui); renderFooter(ui);
+	assert.equal(reads.length, 1, "rendering must not initiate native reads");
+	let renders = 0;
+	const factory = ui.footerFactory as (tui: unknown, theme: ShellBarTheme, footerData: unknown) => { render(width: number): string[]; dispose(): void };
+	const component = factory({ requestRender() { renders++; } }, plainTheme, footerData);
+	try {
+		reads[0]!.result.resolve(modeResult("on"));
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.match(component.render(160)[0], /RDD: ON/);
+		assert.equal(renders, 1, "a changed visible value renders once");
+		pi.events.emit("gentle-pi:rdd-mode-status-changed", { cwd: "/rdd-lifecycle" });
+		assert.equal(reads.length, 2);
+		reads[1]!.result.resolve(modeResult("on", "both"));
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(renders, 1, "a query-breadth-only change must not alter the visible effective scope");
+		const rail = sidebarState(fakeTui as unknown as TUI).parts.get("footer") as SidebarRail;
+		assert.match(rail.render(46).join("\n"), /Scope: default/);
+	} finally { component.dispose(); }
+});
+
+test("RDD lifecycle refreshes only the active cwd and rejects stale or shutdown responses", async () => {
+	const pending: Array<ReturnType<typeof deferred<ReturnType<typeof modeResult>>>> = [];
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { rddModeReader: { reviewMode() {
+		const result = deferred<ReturnType<typeof modeResult>>(); pending.push(result); return result.promise;
+	} } });
+	const first = fakeContext();
+	(first.ctx as unknown as { cwd: string }).cwd = "/rdd-race";
+	await fire(handlers, "session_start", first.ctx);
+	pi.events.emit("gentle-pi:rdd-mode-status-changed", { cwd: "/other" });
+	assert.equal(pending.length, 1, "foreign cwd event must be ignored");
+	pi.events.emit("gentle-pi:rdd-mode-status-changed", { cwd: "/rdd-race" });
+	assert.equal(pending.length, 2);
+	pending[1]!.resolve(modeResult("off"));
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.match(renderFooter(first.ui), /RDD: OFF/);
+	pending[0]!.resolve(modeResult("on"));
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.match(renderFooter(first.ui), /RDD: OFF/, "older response must not win");
+	pi.events.emit("gentle-pi:rdd-mode-status-changed", { cwd: "/rdd-race" });
+	assert.equal(pending.length, 3);
+	await fire(handlers, "session_shutdown", first.ctx);
+	const second = fakeContext();
+	(second.ctx as unknown as { cwd: string }).cwd = "/rdd-next";
+	(second.ctx.sessionManager as unknown as { getSessionId(): string }).getSessionId = () => "rdd-next-session";
+	await fire(handlers, "session_start", second.ctx);
+	pending[3]!.resolve(modeResult("on"));
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.match(renderFooter(second.ui), /RDD: ON/);
+	pending[2]!.resolve(modeResult("off"));
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.match(renderFooter(second.ui), /RDD: ON/, "shutdown response must not alter a later session");
+});
+
+test("RDD event listener survives session changes but ignores inactive sessions", async () => {
+	let reads = 0;
+	const { pi, handlers } = fakePi();
+	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { rddModeReader: { async reviewMode() { reads++; return modeResult("on"); } } });
+	const first = fakeContext();
+	(first.ctx as unknown as { cwd: string }).cwd = "/rdd-session-a";
+	await fire(handlers, "session_start", first.ctx);
+	assert.equal(reads, 1);
+	await fire(handlers, "session_shutdown", first.ctx);
+	pi.events.emit("gentle-pi:rdd-mode-status-changed", { cwd: "/rdd-session-a" });
+	assert.equal(reads, 1, "no active context must ignore mode changes");
+
+	const second = fakeContext();
+	(second.ctx as unknown as { cwd: string }).cwd = "/rdd-session-b";
+	(second.ctx.sessionManager as unknown as { getSessionId(): string }).getSessionId = () => "rdd-session-b";
+	await fire(handlers, "session_start", second.ctx);
+	assert.equal(reads, 2);
+	pi.events.emit("gentle-pi:rdd-mode-status-changed", { cwd: "/rdd-session-b" });
+	assert.equal(reads, 3, "the extension-lifetime listener must refresh the next active session");
+	pi.events.emit("gentle-pi:rdd-mode-status-changed", { cwd: "/other" });
+	assert.equal(reads, 3, "foreign cwd events remain ignored");
+});
+
+test("RDD lifecycle degrades unavailable or rejected readers to unknown", async () => {
+	const unavailable = fakePi();
+	gentleShell(unavailable.pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { rddModeReader: null });
+	const absent = fakeContext();
+	(absent.ctx as unknown as { cwd: string }).cwd = "/rdd-absent";
+	await fire(unavailable.handlers, "session_start", absent.ctx);
+	assert.match(renderFooter(absent.ui), /RDD: \?/);
+
+	const rejected = fakePi();
+	gentleShell(rejected.pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, { rddModeReader: { async reviewMode() { throw new Error("old native capability"); } } });
+	const failed = fakeContext();
+	(failed.ctx as unknown as { cwd: string }).cwd = "/rdd-rejected";
+	await fire(rejected.handlers, "session_start", failed.ctx);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.match(renderFooter(failed.ui), /RDD: \?/);
 });
 
 test("the fullscreen Status rail carries a live digest so a model switch refreshes it", async () => {

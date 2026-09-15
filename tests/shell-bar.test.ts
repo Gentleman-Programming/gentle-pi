@@ -76,12 +76,28 @@ test("formatTokens and formatCost keep the bar compact", () => {
 	assert.equal(formatCost(0.004, false), "$0.004");
 });
 
+test("renderShellBar renders RDD second and removes it before the brand at extreme width", () => {
+	for (const [rddMode, token] of [["on", "RDD: ON"], ["off", "RDD: OFF"], ["unknown", "RDD: ?"]] as const) {
+		const [line] = renderShellBar(model({ rddMode }), plainTheme, 160);
+		assert.ok(line.startsWith(`✿ gentle-pi ⟡ ${token} ⟡`));
+	}
+	const [minimal] = renderShellBar(model({ rddMode: "on" }), plainTheme, 14);
+	assert.match(minimal, /^✿ gentle-pi/);
+	assert.doesNotMatch(minimal, /RDD/);
+});
+
+test("renderShellSidebarBar hides scope while RDD status is unknown", () => {
+	const text = renderShellSidebarBar(model({ rddMode: "unknown", rddScope: "clone" }), plainTheme, 46).join("\n");
+	assert.match(text, /RDD: \?/);
+	assert.doesNotMatch(text, /Scope:/);
+});
+
 test("renderShellBar renders one line with the segments in order", () => {
 	const [line, ...rest] = renderShellBar(model(), plainTheme, 160);
 	assert.equal(rest.length, 0);
 	assert.equal(
 		line,
-		"✿ gentle-pi ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium ⟡ ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub",
+		"✿ gentle-pi ⟡ RDD: ? ⟡ ~/work/gentle-pi main ⟡ gpt-5.5 · medium ⟡ ctx ▰▰▰▰▱▱▱▱ 45% ⟡ $9.49 sub",
 	);
 });
 
@@ -138,7 +154,7 @@ test("renderShellBar appends extension statuses as trailing segments", () => {
 
 test("renderShellBar repaints extension statuses in the bar role, discarding colors the extension embedded", () => {
 	const tagged = { fg: (color: string, text: string) => `<${color}>${text}</${color}>`, bold: (text: string) => text };
-	const [line] = renderShellBar(model({ statuses: ["\x1b[38;2;255;0;0mMCP: 3/3 servers\x1b[0m"] }), tagged, 400);
+	const [line] = renderShellBar(model({ statuses: ["\x1b[38;2;255;0;0mMCP: 3/3 servers\x1b[0m"] }), tagged, 500);
 	assert.match(line, /<muted>MCP: 3\/3 servers<\/muted>$/);
 	assert.doesNotMatch(line, /\x1b\[/);
 });
@@ -147,8 +163,8 @@ test("renderShellBar compacts the path and branch before it sacrifices an extens
 	const long = model({ branch: "fix/shell-bar-status-ansi", dirty: 2, statuses: ["MCP: 3/3 servers"] });
 	const [full] = renderShellBar(long, plainTheme, 160);
 	assert.match(full, /~\/work\/gentle-pi fix\/shell-bar-status-ansi ±2 .* MCP: 3\/3 servers$/);
-	const [compact] = renderShellBar(long, plainTheme, 118);
-	assert.ok(visibleWidth(compact) <= 118, `line overflowed: ${visibleWidth(compact)}`);
+	const [compact] = renderShellBar(long, plainTheme, 128);
+	assert.ok(visibleWidth(compact) <= 128, `line overflowed: ${visibleWidth(compact)}`);
 	assert.match(compact, /⟡ gentle-pi fix\/shell-bar-… ±2 ⟡/);
 	assert.match(compact, /MCP: 3\/3 servers$/);
 });

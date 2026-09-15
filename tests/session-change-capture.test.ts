@@ -4,20 +4,20 @@ import { mkdtemp, writeFile, rm, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { installSessionChangeCapture } from "../lib/session-change-capture.ts";
-import { SessionChanges, SESSION_CHANGE_ENTRY } from "../lib/session-changes.ts";
+import { SessionChanges, SESSION_CHANGE_ENTRY, SESSION_CHANGE_RELAY } from "../lib/session-changes.ts";
 
 async function fixture(run: (f: any) => Promise<void>, child = false) {
 	const root = await realpath(await mkdtemp(join(tmpdir(), "change-capture-")));
 	const handlers = new Map<string, Function>();
 	const entries: any[] = [];
-	const listeners = new Map<string, Function>();
+	const listeners = new Map<string, Set<Function>>();
 	const pi = { on: (key, fn) => handlers.set(key, fn), appendEntry: (customType, data) => entries.push({type:"custom",customType,data}),
-		events: { on: (key, fn) => { listeners.set(key, fn); return () => listeners.delete(key); }, emit: (key, data) => listeners.get(key)?.(data) } };
-	let id = "session";
-	const ctx = { cwd:root, sessionManager: { getSessionId: () => id, getEntries: () => entries } };
-	installSessionChangeCapture(pi as never, child ? {GENTLE_PI_AGENTS_CHILD:"1"} : {}, () => ({root,commonDir:root}));
+		events: { on: (key, fn) => { const subscribers = listeners.get(key) ?? new Set(); subscribers.add(fn); listeners.set(key, subscribers); return () => subscribers.delete(fn); }, emit: (key, data) => listeners.get(key)?.forEach((listener) => listener(data)) } };
+	let id = "session", cwd = root;
+	const ctx = { get cwd() { return cwd; }, sessionManager: { getSessionId: () => id, getEntries: () => entries } };
+	installSessionChangeCapture(pi as never, child ? {GENTLE_PI_AGENTS_CHILD:"1"} : {}, (cwd) => ({root:cwd,commonDir:root}));
 	const fire = (key, event = {}) => handlers.get(key)?.(event, ctx);
-	try { await fire("session_start"); await run({root, entries, ctx, fire, switchSession: () => id = "other"}); }
+	try { await fire("session_start"); await run({root, pi, entries, ctx, fire, listenerCount: (key) => listeners.get(key)?.size ?? 0, switchSession: (nextId = "other", nextCwd = root) => { id = nextId; cwd = nextCwd; }}); }
 	finally { await rm(root, {recursive:true,force:true}); }
 }
 
@@ -55,6 +55,26 @@ test("failed and stale-session tool outcomes never add session changes", async (
 	await fire("tool_result",{...event,toolCallId:"x",isError:false});
 	await fire("tool_execution_end",{toolCallId:"x",toolName:"write",isError:false});
 	assert.equal(entries.length,0);
+}));
+
+test("session change relays remain subscribed across sessions and inert between them", async () => fixture(async ({root,pi,entries,fire,listenerCount,switchSession}) => {
+	assert.equal(listenerCount(SESSION_CHANGE_RELAY), 1, "the relay subscription must be installed once per extension instance");
+	const evidence = (id: string, evidenceRoot = root) => ({ id, root: evidenceRoot, path: "own.ts", before: { kind: "absent" as const }, after: { kind: "text" as const, text: "agent\n" } });
+	pi.events.emit(SESSION_CHANGE_RELAY, { sessionId: "session", evidence: evidence("first") });
+	assert.equal(entries.length, 1);
+	await fire("session_shutdown");
+	pi.events.emit(SESSION_CHANGE_RELAY, { sessionId: "session", evidence: evidence("between") });
+	assert.equal(entries.length, 1, "relays without an active session must be inert");
+	const nextRoot = `${root}/next`;
+	switchSession("other", nextRoot);
+	await fire("session_start");
+	assert.equal(listenerCount(SESSION_CHANGE_RELAY), 1, "a new session must not add a duplicate relay subscription");
+	pi.events.emit(SESSION_CHANGE_RELAY, { sessionId: "other", evidence: evidence("second", nextRoot) });
+	assert.deepEqual(entries.map((entry) => entry.data), [
+		{ sessionId: "session", evidence: evidence("first") },
+		{ sessionId: "other", evidence: evidence("second", nextRoot) }, 
+	]);
+	await fire("session_shutdown");
 }));
 
 test("child carries bounded evidence in the existing tool-result details transport", async () => fixture(async ({root,fire,entries}) => {
