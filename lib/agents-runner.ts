@@ -58,6 +58,9 @@ export interface RunnerDeps {
 export interface RunnerLimits {
 	maxConcurrency: number;
 	stallTimeoutMs: number;
+	// Longer ceiling used while an announced tool call is in flight. Optional so
+	// callers that only bound silence keep the idle budget as the tool ceiling.
+	toolStallTimeoutMs?: number;
 }
 
 export interface AskAnswer {
@@ -277,6 +280,10 @@ interface LiveTask {
 	acknowledgedIpcIds: Set<string>;
 	acknowledgedIpcOrder: string[];
 	mutationStarts: Map<string, { toolName: "write" | "edit"; toolCallId: string; path: string }>;
+	// Tool calls the child announced and has not ended yet. A call in flight is
+	// live work, so the watchdog gives it the tool ceiling instead of the idle
+	// silence budget. Keyed by call id, holding the announced tool name.
+	inFlightTools: Map<string, string>;
 	// Bounded ring buffer of the child's raw stderr output, capped to the last
 	// STDERR_TAIL_MAX characters. Only surfaced on the stall and pre-settle exit
 	// terminal paths, never on completed, cancelled, or other failure reasons.
@@ -562,7 +569,7 @@ export class AgentRunner {
 			return;
 		}
 		const processGroup = detached && typeof child.pid === "number" && child.pid > 0 ? child.pid : undefined;
-		const live: LiveTask = { child, mutationStarts: new Map(), pending: new Map(), queries: new Map(), replies: new Map(), cancelStall: () => {}, cancelGrace: () => {}, processGroup, terminal: undefined, childExit: undefined, cleanupDeadlineAt: undefined, quarantined: false, nextId: 0, ipcClosed: false, acknowledgedIpcIds: new Set(), acknowledgedIpcOrder: [], stderrTail: "" };
+		const live: LiveTask = { child, mutationStarts: new Map(), inFlightTools: new Map(), pending: new Map(), queries: new Map(), replies: new Map(), cancelStall: () => {}, cancelGrace: () => {}, processGroup, terminal: undefined, childExit: undefined, cleanupDeadlineAt: undefined, quarantined: false, nextId: 0, ipcClosed: false, acknowledgedIpcIds: new Set(), acknowledgedIpcOrder: [], stderrTail: "" };
 		if (request.prepareResponseObservations) {
 			let ready = false;
 			live.observationPreparation = () => ready;
@@ -645,13 +652,20 @@ export class AgentRunner {
 		return cleaned ? `; stderr: ${cleaned}` : "";
 	}
 
+	// An idle child is bounded by the silence budget; a child whose announced
+	// tool call is still running is live work and bounded by the longer tool
+	// ceiling. The budget is chosen from the state at arm time, and every RPC
+	// object re-arms, so a finished tool call returns the task to idle silence.
 	private armStall(id: string, live: LiveTask): void {
 		live.cancelStall();
+		const tool = live.inFlightTools.values().next().value;
+		const budget = tool === undefined ? this.limits.stallTimeoutMs : Math.max(this.limits.toolStallTimeoutMs ?? this.limits.stallTimeoutMs, this.limits.stallTimeoutMs);
 		live.cancelStall = this.deps.schedule(() => {
 			const lastStep = this.store.get(id)?.lastStep ?? "starting";
-			const minutes = Math.round(this.limits.stallTimeoutMs / 60_000);
-			this.requestStop(id, TASK_STATUS.TIMED_OUT, `stalled for ${minutes} min after: ${lastStep}${this.stderrSuffix(live)}`);
-		}, this.limits.stallTimeoutMs);
+			const minutes = Math.round(budget / 60_000);
+			if (tool === undefined) this.requestStop(id, TASK_STATUS.TIMED_OUT, `stalled for ${minutes} min after: ${lastStep}${this.stderrSuffix(live)}`);
+			else this.requestStop(id, TASK_STATUS.TIMED_OUT, `stalled for ${minutes} min with tool "${tool}" still running after: ${lastStep}${this.stderrSuffix(live)}`);
+		}, budget);
 	}
 
 	private send(id: string, command: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -790,8 +804,8 @@ export class AgentRunner {
 		const raw = value as Record<string, unknown>;
 		const remediation = this.store.get(id)?.sddRemediation;
 		if (remediation) observeRemediationTool(remediation, raw);
-		this.armStall(id, live);
 		if (raw.type === "response") {
+			this.armStall(id, live);
 			if (!live.observationPreparation) this.checkObservationGrant(live);
 			const pending = typeof raw.id === "string" ? live.pending.get(raw.id) : undefined;
 			if (pending) {
@@ -812,12 +826,14 @@ export class AgentRunner {
 			}
 			this.store.apply(id, event, this.deps.now());
 			if (event.type === TASK_EVENT.TOOL_START && event.callId) {
+				live.inFlightTools.set(event.callId, event.name);
 				live.mutationStarts.delete(event.callId);
 				if ((event.name === "write" || event.name === "edit") && typeof event.args.path === "string" && event.args.path.trim()) {
 					live.mutationStarts.set(event.callId, { toolName: event.name, toolCallId: event.callId, path: event.args.path });
 				}
 			}
 			if (event.type === TASK_EVENT.TOOL_END) {
+				live.inFlightTools.delete(event.callId);
 				const mutation = live.mutationStarts.get(event.callId);
 				live.mutationStarts.delete(event.callId);
 				const task = this.store.get(id);
@@ -839,6 +855,7 @@ export class AgentRunner {
 				else this.requestStop(id, TASK_STATUS.FAILED, "assistant settled without a final report");
 			}
 		}
+		if (!live.terminal) this.armStall(id, live);
 	}
 
 	// Task-mode subagents may ask the human through the host; background ones
@@ -881,6 +898,7 @@ export class AgentRunner {
 		if (!live || live.terminal) return;
 		live.terminal = { status, error };
 		live.mutationStarts.clear();
+		live.inFlightTools.clear();
 		live.cleanupDeadlineAt = this.deps.now() + GROUP_CONFIRM_DEADLINE_MS;
 		live.permissionBroker?.close();
 		this.closeIpc(live);

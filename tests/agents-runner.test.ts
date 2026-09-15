@@ -26,7 +26,7 @@ interface Harness {
 	spawnOptions: Array<{ env: NodeJS.ProcessEnv; stdio?: string[] }>;
 }
 
-function harness(options: { pid?: number; maxConcurrency?: number; stallTimeoutMs?: number; answer?: Record<string, unknown>; exitOnKill?: boolean; state?: Record<string, unknown>; stateSuccess?: boolean; onNotification?: RunnerHooks["onNotification"]; onSuccessfulMutation?: RunnerHooks["onSuccessfulMutation"]; onFinish?: RunnerHooks["onFinish"] } = {}): Harness {
+function harness(options: { pid?: number; maxConcurrency?: number; stallTimeoutMs?: number; toolStallTimeoutMs?: number; answer?: Record<string, unknown>; exitOnKill?: boolean; state?: Record<string, unknown>; stateSuccess?: boolean; onNotification?: RunnerHooks["onNotification"]; onSuccessfulMutation?: RunnerHooks["onSuccessfulMutation"]; onFinish?: RunnerHooks["onFinish"] } = {}): Harness {
 	const children: FakeChild[] = [];
 	const timers: Harness["timers"] = [];
 	const asks: Harness["asks"] = [];
@@ -60,7 +60,7 @@ function harness(options: { pid?: number; maxConcurrency?: number; stallTimeoutM
 		pi: { command: "pi", args: [] },
 	};
 	const store = new TaskStore();
-	const runner = new AgentRunner(store, { maxConcurrency: options.maxConcurrency ?? 2, stallTimeoutMs: options.stallTimeoutMs ?? 10_000 }, deps, {
+	const runner = new AgentRunner(store, { maxConcurrency: options.maxConcurrency ?? 2, stallTimeoutMs: options.stallTimeoutMs ?? 10_000, toolStallTimeoutMs: options.toolStallTimeoutMs }, deps, {
 		askUser: async (taskId, ask) => {
 			asks.push({ taskId, method: ask.method });
 			return options.answer ?? { value: "yes" };
@@ -838,6 +838,56 @@ test("AgentRunner has no total-duration watchdog but keeps active work alive and
 	await tick();
 	assert.equal(store.get(task.id)?.status, TASK_STATUS.TIMED_OUT);
 	assert.match(store.get(task.id)?.error ?? "", /stalled/);
+});
+
+test("an announced tool call in flight arms the tool ceiling and names the tool when it fires", async () => {
+	const h = harness({ stallTimeoutMs: FOUR_MIN_MS, toolStallTimeoutMs: 30 * 60_000 });
+	const task = h.runner.run(request());
+	await tick();
+	h.children[0].emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash", args: { command: "pnpm test" } });
+	await tick();
+	assert.equal(h.store.get(task.id)?.lastStep, "bash");
+	assert.equal(h.timers.filter((timer) => timer.ms === FOUR_MIN_MS && !timer.cancelled).length, 0, "the idle budget no longer bounds a task with a tool in flight");
+	const toolTimer = h.timers.filter((timer) => timer.ms === 30 * 60_000 && !timer.cancelled).at(-1);
+	assert.ok(toolTimer, "an in-flight tool call arms the tool ceiling");
+	toolTimer!.fn();
+	await tick();
+	assert.equal(h.store.get(task.id)?.status, TASK_STATUS.TIMED_OUT);
+	assert.equal(h.store.get(task.id)?.error, 'stalled for 30 min with tool "bash" still running after: bash');
+});
+
+test("a finished tool call returns the task to the idle silence budget", async () => {
+	const h = harness({ stallTimeoutMs: FOUR_MIN_MS, toolStallTimeoutMs: 30 * 60_000 });
+	const task = h.runner.run(request());
+	await tick();
+	h.children[0].emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash", args: { command: "pnpm test" } });
+	await tick();
+	h.children[0].emit({ type: "tool_execution_end", toolCallId: "t1", isError: false });
+	await tick();
+	assert.equal(h.timers.filter((timer) => timer.ms === 30 * 60_000 && !timer.cancelled).length, 0, "a finished tool is back on the idle budget");
+	const idle = h.timers.filter((timer) => timer.ms === FOUR_MIN_MS && !timer.cancelled).at(-1);
+	assert.ok(idle, "tool_end re-arms the idle budget");
+	idle!.fn();
+	await tick();
+	assert.equal(h.store.get(task.id)?.status, TASK_STATUS.TIMED_OUT);
+	assert.equal(h.store.get(task.id)?.error, "stalled for 4 min after: bash");
+});
+
+test("the tool ceiling holds while any announced tool call is still in flight", async () => {
+	const h = harness({ stallTimeoutMs: FOUR_MIN_MS, toolStallTimeoutMs: 30 * 60_000 });
+	h.runner.run(request());
+	await tick();
+	h.children[0].emit({ type: "tool_execution_start", toolCallId: "t1", toolName: "bash", args: { command: "pnpm test" } });
+	await tick();
+	h.children[0].emit({ type: "tool_execution_start", toolCallId: "t2", toolName: "bash", args: { command: "pnpm run typecheck" } });
+	await tick();
+	h.children[0].emit({ type: "tool_execution_end", toolCallId: "t1", isError: false });
+	await tick();
+	assert.ok(h.timers.filter((timer) => timer.ms === 30 * 60_000 && !timer.cancelled).length > 0, "a second tool still in flight keeps the tool ceiling");
+	assert.equal(h.timers.filter((timer) => timer.ms === FOUR_MIN_MS && !timer.cancelled).length, 0);
+	h.children[0].emit({ type: "tool_execution_end", toolCallId: "t2", isError: false });
+	await tick();
+	assert.ok(h.timers.filter((timer) => timer.ms === FOUR_MIN_MS && !timer.cancelled).length > 0, "ending the last tool returns to the idle budget");
 });
 
 test("AgentRunner.cancelAll stops every queued and running task", async () => {
