@@ -6040,7 +6040,7 @@ async function reconcileNativeMutationFailure(
 
 function reviewWorkspaceGitIdentity(cwd: string): { toplevel: string; commonDir: string } {
 	const git = (...arguments_: string[]): string =>
-		execFileSync("git", arguments_, { cwd, encoding: "utf8" }).trim();
+		execFileSync("git", arguments_, { cwd, encoding: "utf8", windowsHide: true }).trim();
 	const toplevel = realpathSync(git("rev-parse", "--show-toplevel"));
 	const commonDir = realpathSync(resolve(cwd, git("rev-parse", "--git-common-dir")));
 	return { toplevel, commonDir };
