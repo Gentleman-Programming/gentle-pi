@@ -9,6 +9,18 @@ Organic Driven Development (ODD) keeps explore → implement → proportionate c
 
 Choose SDD explicitly when you want separate proposal, spec, design, tasks, and verification artifacts. Its phases and handoffs add coordination; everyday work usually needs the intent and evidence, not that extra workflow. ODD keeps those in one document. Size, ambiguity, and risk alone never select SDD.
 
+### The ODD protocol
+
+ODD is the predefined workflow: it runs by default on every request, without the user asking for a workflow, a plan, or task tracking. SDD is a branch inside ODD, entered only by an explicit request or an accepted proposal.
+
+1. **Authorize** — read-only unless implementation is authorized; ask one clarification when intent is ambiguous.
+2. **Explore** — read existing code and requirements first, proportionately to the request.
+3. **Resolve uncertainty** — optional research or one focused product question only for a real unresolved decision.
+4. **Classify** — substantial when exploration yields two or more meaningful implementation steps; small work stays small.
+5. **Track before the first write** — create the feature document and Engram mirror automatically for substantial work, and tell the user in one line.
+6. **Implement task by task** — route each task through the smallest safe workflow, with configured TDD and applicable checks.
+7. **Close** — report the verified outcome, failed/pending checks, and the next step.
+
 - **One feature document:** `odd/tasks/<feature-name>.md` holds objective, problem, why, scope, constraints, actionable checklist with stable IDs and acceptance criteria, verification evidence, progress, and next step. Project-scoped Engram topic `odd/<feature-name>/tasks` mirrors the full document and repository-relative locator. Keep concise rationale for meaningful accepted changes here, not a separate plan or exhaustive journal. Accepted user, review, or verification changes update intent and tasks together; preserve valid completed work, add new tasks or reopen invalidated items with reasons. Findings alone do not authorize expansion or acceptance. Routine corrections stay with their tasks; checkoffs require observed proof.
 - **Recovery:** write local progress first and read back both copies; writes are not atomic. Unavailable Engram leaves an explicit pending mirror, not invented success or a block on unrelated safe work. Before implementation or resume, the parent reads full feature memory and the actual task file, reconciles code and evidence, and preserves conflicting versions. Pass the locator and relevant context; workers read the document before edits. The existing Todo UI is a projection, not another authority.
 - **Task size:** about 400 authored changed lines (additions plus deletions) is advisory only, not a cap, acceptance criterion, automatic stop, forced split, or RDD trigger. Keep coherent behavior with tests and docs, explain natural overages, and continue under existing PR policy. Forward this instruction to workers; never remove whitespace, comments, or tests, minify, invent abstractions, or split artificially for cosmetic savings.
