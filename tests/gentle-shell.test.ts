@@ -777,6 +777,11 @@ test("kimi-coding usage is fetched with the subscription bearer token and lands 
 				}),
 			};
 		}) as unknown as typeof fetch,
+		readFile: async (path: string) => {
+			if (path.includes("auth.json")) return JSON.stringify({ "kimi-coding": { type: "oauth", access: "kimi-key", expires: Date.now() + 3600_000 } });
+			throw new Error("not found");
+		},
+		homedir: () => "/home/alan",
 	};
 	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, deps);
 	const { ctx, ui } = fakeContext({ token: "kimi-key" });
@@ -803,6 +808,8 @@ test("kimi-coding usage skips the fetch when no bearer token is available", asyn
 	let fetches = 0;
 	const deps = {
 		fetch: (async () => { fetches += 1; return { ok: true, json: async () => ({ usage: {}, limits: [] }) }; }) as unknown as typeof fetch,
+		readFile: async () => { throw new Error("not found"); },
+		homedir: () => "/home/alan",
 	};
 	gentleShell(pi, { GENTLE_PI_SHELL_CHANGES_WATCH_MS: "off" }, deps);
 	const { ctx, ui } = fakeContext({ token: undefined });

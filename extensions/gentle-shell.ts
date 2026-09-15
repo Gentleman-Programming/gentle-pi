@@ -2,6 +2,7 @@ import { CustomEditor, keyHint, type ExtensionAPI, type ExtensionContext, type K
 import type { EditorTheme, TUI } from "@earendil-works/pi-tui";
 import { execFile, spawnSync } from "node:child_process";
 import { statSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { profilesFilePath, readProfilesFileResult } from "../lib/agent-profiles.ts";
 import * as os from "node:os";
 import { join } from "node:path";
@@ -57,6 +58,8 @@ export interface ShellDeps {
 	devBinary(): DevBinaryNotice | undefined;
 	resolveWorktree: WorktreeResolver;
 	gitRunner(cwd: string): GitRunner;
+	readFile(path: string, encoding: "utf8"): Promise<string>;
+	homedir(): string;
 }
 
 // The rail digest runs every frame. Cache parsing by file identity and metadata,
@@ -94,7 +97,7 @@ function ambientDevBinary(): DevBinaryNotice | undefined {
 	}
 }
 
-const defaultShellDeps: Omit<ShellDeps, "activeProfile"> = { fetch: (...args) => globalThis.fetch(...args), now: () => Date.now(), devBinary: ambientDevBinary, resolveWorktree: resolveSessionWorktree, gitRunner: shellGitRunner };
+const defaultShellDeps: Omit<ShellDeps, "activeProfile"> = { fetch: (...args) => globalThis.fetch(...args), now: () => Date.now(), devBinary: ambientDevBinary, resolveWorktree: resolveSessionWorktree, gitRunner: shellGitRunner, readFile: (path, encoding) => readFile(path, encoding), homedir: () => os.homedir() };
 
 interface AssistantUsageEntry {
 	type: string;
@@ -465,6 +468,21 @@ export async function fetchCodexUsage(token: string | undefined, fetchFn: typeof
 
 // Kimi Code usage is reachable with the same bearer token pi holds for the
 // subscription. The endpoint answers the weekly plan quota plus per-window caps.
+// Unlike Codex, Kimi's OAuth credential exposes the token under headers.Authorization
+// rather than auth.apiKey, so we read it from the auth file the way Claude does.
+export async function readKimiCodeToken(deps: Pick<ShellDeps, "readFile" | "homedir">, now: number): Promise<string | undefined> {
+	try {
+		const raw = await deps.readFile(join(deps.homedir(), ".pi", "agent", "auth.json"), "utf8");
+		const data = JSON.parse(raw) as { "kimi-coding"?: { type?: string; access?: string; expires?: number } };
+		const credential = data["kimi-coding"];
+		if (credential?.type !== "oauth" || typeof credential.access !== "string" || credential.access.length === 0) return undefined;
+		if (typeof credential.expires === "number" && credential.expires <= now) return undefined;
+		return credential.access;
+	} catch {
+		return undefined;
+	}
+}
+
 export async function fetchKimiUsage(token: string | undefined, fetchFn: typeof fetch, now: number): Promise<ProviderUsage | undefined> {
 	if (!token) return undefined;
 	try {
@@ -491,7 +509,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		usageFetchedAt = now;
 		let fetched: ProviderUsage | undefined;
 		if (provider === KIMI_PROVIDER) {
-			const token = await ctx.modelRegistry.getApiKeyForProvider(KIMI_PROVIDER).catch(() => undefined);
+			const token = await readKimiCodeToken(deps, deps.now());
 			fetched = await fetchKimiUsage(token, deps.fetch, deps.now());
 		} else {
 			const token = await ctx.modelRegistry.getApiKeyForProvider(CODEX_PROVIDER).catch(() => undefined);
