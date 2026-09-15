@@ -134,24 +134,41 @@ export function installSidebar(tui: TUI, theme: ShellBarTheme): () => void {
 		}
 		try {
 			const contentWidth = scroll.getContentWidth(RAIL_WIDTH);
-			const sections = ["footer", "changes", "agents", "todo"].map((key) => {
-				const component = state.parts.get(key);
-				const lines = [...(component?.render(contentWidth - RAIL_PADDING * 2) ?? [])];
-				while (lines.length && lines[lines.length - 1]?.trim() === "") lines.pop();
+			const KNOWN = ["footer", "changes", "agents", "todo"];
+			const collect = (keys: Array<[string, SidebarRail]>, keepBlank = false) => keys.map(([key, component]) => {
+				const lines = [...component.render(contentWidth - RAIL_PADDING * 2)];
+				// Top-placed parts keep their blank rows: an animated part (portrait
+				// reveal) owns stable geometry and must not flap the rail while its
+				// frame is blank; only a truly empty render (not loaded) drops out.
+				if (!keepBlank) while (lines.length && lines[lines.length - 1]?.trim() === "") lines.pop();
 				return { key, component, lines };
-			}).filter((section) => section.component !== undefined && section.lines.length > 0) as Array<{ key: string; component: Component; lines: string[] }>;
+			}).filter((section) => section.lines.length > 0);
+			const knownKeys = new Set(KNOWN);
+			// Built-in sections keep their canonical order; external parts render
+			// before branding with placement "top", after them otherwise.
+			const topSections = collect(parts.filter(([key, part]) => !knownKeys.has(key) && part.placement === "top"), true);
+			const sections = collect(KNOWN.flatMap((key) => {
+				const component = state.parts.get(key);
+				return component ? [[key, component] as [string, SidebarRail]] : [];
+			}));
+			const bottomSections = collect(parts.filter(([key, part]) => !knownKeys.has(key) && part.placement !== "top"));
 			const branding = renderSidebarBanner(theme, contentWidth - RAIL_PADDING * 2);
 			const hits: RailHit[] = [];
 			railLines = [];
-			if (sections.length && branding.length) {
-				railLines.push(...branding.map((line) => " ".repeat(RAIL_PADDING) + line + " ".repeat(RAIL_PADDING)));
-			}
-			for (const section of sections) {
+			const pushSection = (section: { key: string; component: Component; lines: string[] }) => {
 				if (railLines.length > 0) railLines.push("");
 				const startY = railLines.length;
 				railLines.push(...section.lines.map((line) => " ".repeat(RAIL_PADDING) + line + " ".repeat(RAIL_PADDING)));
-				hits.push({ key: section.key, component: section.component, startY, height: section.lines.length, width: contentWidth - RAIL_PADDING * 2 });
+				if (section.component.handleMouse) hits.push({ key: section.key, component: section.component, startY, height: section.lines.length, width: contentWidth - RAIL_PADDING * 2 });
+			};
+			for (const section of topSections) pushSection(section);
+			if (railLines.length === 0 && sections.length && branding.length) {
+				railLines.push(...branding.map((line) => " ".repeat(RAIL_PADDING) + line + " ".repeat(RAIL_PADDING)));
+			} else if (sections.length && branding.length) {
+				railLines.push("");
+				railLines.push(...branding.map((line) => " ".repeat(RAIL_PADDING) + line + " ".repeat(RAIL_PADDING)));
 			}
+			for (const section of [...sections, ...bottomSections]) pushSection(section);
 			// Height is owned by the native ScrollView, never by the transcript.
 			const active = railLines.length > 0 && railLines.every((line) => visibleWidth(line) <= contentWidth);
 			prepared = { revision: cache.revision, width, mode: host.mode, root, theme, parts, digests, contentWidth, active, lines: railLines, hits };

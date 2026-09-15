@@ -18,6 +18,13 @@ export interface SidebarRail extends Component {
 	 * one; explicit invalidateSidebar() stays for discrete state changes.
 	 */
 	digest?(): string;
+	/**
+	 * Rail placement for parts outside the built-in set. "top" rows render before
+	 * the branding banner (portraits, identity art); anything else renders after
+	 * the known sections in registration order. Older layouts ignore unknown
+	 * parts, so external extensions degrade invisibly.
+	 */
+	placement?: "top" | "bottom";
 }
 export function sidebarState(tui: TUI): SidebarState {
 	const terminal = tui.terminal as unknown as Record<symbol, SidebarState>;
