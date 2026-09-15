@@ -33,7 +33,7 @@ import type {
 	ToolCallEventResult,
 } from "@earendil-works/pi-coding-agent";
 import { Key, isKeyRelease, matchesKey, truncateToWidth, type KeybindingsManager, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
-import { resolveGentlePiAgentHome } from "../lib/agent-home.ts";
+import { resolveGentlePiAgentHome, gentlePiConfigHome } from "../lib/agent-home.ts";
 import {
 	ensureSddPreflight,
 	getSddPreflightPreferences,
@@ -90,6 +90,16 @@ import {
 	type ProfileRoutingRow,
 	type ProfilesParseDrops,
 } from "../lib/agent-profiles.ts";
+import {
+	clearProfilePinSync,
+	evaluateProfilePin,
+	readProfilePinStatus,
+	resolveProfilePin,
+	writeProfilePinSync,
+	type ProfilePinEvaluation,
+	type ProfilePinSource,
+	type ProfilePinStatus,
+} from "../lib/agent-profile-pin.ts";
 import {
 	applyOrchestratorSettings,
 	readOrchestratorSettings,
@@ -2048,7 +2058,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function gentleAiConfigHome(): string {
-	return process.env.GENTLE_PI_CONFIG_HOME ?? join(homedir(), ".pi", "gentle-ai");
+	return gentlePiConfigHome();
 }
 
 function modelConfigPath(_cwd: string): string {
@@ -2305,12 +2315,25 @@ async function readMaterializedRoutingEntryAsync(
 }
 
 /**
+ * The routing a launch would resolve: a winning per-repository pin replaces subagent
+ * routing wholesale, so when one wins it is the effective routing. The launch
+ * resolver decides, so the profile shown as effective is exactly the profile a launch
+ * would use -- there is no second precedence rule here.
+ */
+function pinnedEffectiveModelConfig(cwd: string): AgentModelConfig | undefined {
+	const resolution = resolveProfilePin({ cwd, configHome: gentleAiConfigHome() });
+	return resolution === undefined ? undefined : cloneModelConfig(resolution.modelProfiles);
+}
+
+/**
  * The routing in effect: `models.json` where it speaks, and the materialized
  * stores the runtime resolves from for every discoverable agent it is silent
  * about. A sparse `models.json` therefore never hides routing that is still
- * live (#1012). Reading never writes.
+ * live (#1012). A winning pin outranks both. Reading never writes.
  */
 function readEffectiveModelConfig(cwd: string): AgentModelConfig {
+	const pinned = pinnedEffectiveModelConfig(cwd);
+	if (pinned) return pinned;
 	const effective = cloneModelConfig(readModelConfig(cwd));
 	const profilesByPath = new Map<string, Record<string, unknown>>();
 	for (const agent of listDiscoverableAgents(cwd)) {
@@ -2322,6 +2345,8 @@ function readEffectiveModelConfig(cwd: string): AgentModelConfig {
 }
 
 async function readEffectiveModelConfigAsync(cwd: string): Promise<AgentModelConfig> {
+	const pinned = pinnedEffectiveModelConfig(cwd);
+	if (pinned) return pinned;
 	const effective = cloneModelConfig(await readModelConfigAsync(cwd));
 	const profilesByPath = new Map<string, Record<string, unknown>>();
 	for (const agent of await listDiscoverableAgentsAsync(cwd)) {
@@ -3427,6 +3452,11 @@ async function showSddModelPanel(
 
 async function handleModelsCommand(ctx: ExtensionContext): Promise<void> {
 	migrateLegacyProjectModelOverrides(ctx.cwd);
+	// A pinned repository resolves its subagent routing from the profile at launch,
+	// so global routing written here will not reach its subagents. Saying it before
+	// the edits, not after them, is the difference between a note and a surprise.
+	const pinNote = profilePinScopeNote(ctx.cwd);
+	if (pinNote) ctx.ui.notify(pinNote, "info");
 	const savedConfig = await readModelRoutingAuthorityAsync(
 		modelConfigPath(ctx.cwd),
 		legacyProjectModelConfigPath(ctx.cwd),
@@ -3551,6 +3581,7 @@ type ProfilesPanelResult =
 	| { type: "rename"; name: string }
 	| { type: "delete"; name: string }
 	| { type: "export"; name: string }
+	| { type: "pin"; source: ProfilePinSource; name: string }
 	| { type: "import" }
 	| { type: "close" };
 
@@ -3566,6 +3597,125 @@ function hasOwnProfile(profiles: Record<string, unknown>, name: string): boolean
 
 function profilesErrorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * The pin layer that wins, in one line: the winning layer's scope, name, and exact
+ * file path, or the first stale layer named as missing from the loaded store. An
+ * invalid layer is reported by `profilePinDetailLines` instead, because a file that
+ * is not a pin is not a layer that could ever win.
+ */
+function profilePinStateLabel(
+	status: ProfilePinStatus | undefined,
+	evaluation: ProfilePinEvaluation,
+): string {
+	if (!status) return "none (not inside a Git worktree)";
+	if (evaluation.winner) {
+		return `${evaluation.winner.source}: ${evaluation.winner.profile} — ${evaluation.winner.path}`;
+	}
+	const stale = evaluation.stale[0];
+	if (stale) return `${stale.source}: ${stale.profile} (missing from this store) — ${stale.path}`;
+	return "none";
+}
+
+/**
+ * Every line the panel needs to tell a pinned repository the truth: the winning
+ * layer and its exact file, an explicit warning for a file that is not a pin named
+ * by path (kept separate from a pin naming a profile this store no longer defines),
+ * and one sentence that a winning pin outranks the global active profile and every
+ * `/gentle:models` write.
+ */
+function profilePinDetailLines(
+	status: ProfilePinStatus | undefined,
+	profiles: Record<string, unknown>,
+): string[] {
+	const evaluation = evaluateProfilePin(status, profiles);
+	const lines = [`pin           ${profilePinStateLabel(status, evaluation)}`];
+	const shownStale = evaluation.winner ? undefined : evaluation.stale[0];
+	for (const issue of evaluation.invalid) {
+		lines.push(`              invalid pin file ${issue.path} (${issue.source} layer); ignoring it — fix or remove the file.`);
+	}
+	for (const issue of evaluation.stale) {
+		if (issue === shownStale) continue;
+		lines.push(`              the ${issue.source} pin names "${issue.profile}", which this store does not define; ignoring it (${issue.path}).`);
+	}
+	if (evaluation.winner) {
+		lines.push("              This repository's subagent routing comes from the pin; the globally active profile and /gentle:models writes do not apply here.");
+	}
+	return lines;
+}
+
+/**
+ * Keep the clone-scoped pin pointing at the profile it names after a rename. The
+ * repository declaration is a tracked file, so rewriting it would churn a commit
+ * behind the operator's back; a declaration that still names the old profile is
+ * reported instead, and `P` republishes it. Layers that name something else, or no
+ * layer at all, are left alone.
+ */
+function followRenamedPin(
+	cwd: string,
+	from: string,
+	to: string,
+): { followed: string[]; stillDeclared: string[] } {
+	const status = readProfilePinStatus(cwd);
+	if (!status) return { followed: [], stillDeclared: [] };
+	const followed: string[] = [];
+	const stillDeclared: string[] = [];
+	if (status.local.status === "valid" && status.local.profile === from) {
+		try {
+			writeProfilePinSync(status.localPath, to);
+			followed.push(status.localPath);
+		} catch {
+			// A pin that cannot be rewritten is reported by the pin line and degrades to
+			// the global routing, exactly like any other stale pin; a rename that already
+			// succeeded in the store is not undone by it.
+		}
+	}
+	if (status.repo.status === "valid" && status.repo.profile === from) {
+		stillDeclared.push(status.repoPath);
+	}
+	return { followed, stillDeclared };
+}
+
+/**
+ * One sentence naming the profile this repository resolves, for the commands whose
+ * writes a pin outranks: `/gentle:models` materializes global routing that a pinned
+ * repository will not use for its subagents. The launch resolver decides, so the note
+ * names exactly what a launch would use.
+ */
+function profilePinScopeNote(cwd: string): string | undefined {
+	const resolution = resolveProfilePin({ cwd, configHome: gentleAiConfigHome() });
+	if (!resolution) return undefined;
+	return `This repository pins profile "${resolution.profile}" (${resolution.source} pin at ${resolution.path}), so its subagent launches resolve that profile instead of the global routing. Change or remove the pin with /gentle:profiles (p or P).`;
+}
+
+/**
+ * Whether the committed declaration would actually be committed. This shells out to
+ * Git, so it runs only on the key press that writes the declaration and makes at most
+ * two bounded calls. Any Git failure is reported as unknown instead of thrown: a pin
+ * write that already succeeded must not become an error because a probe about sharing
+ * it failed.
+ */
+function repoDeclarationSharing(root: string, path: string): string {
+	const relativePath = relative(root, path).split(sep).join("/");
+	const run = (...arguments_: string[]): string =>
+		execFileSync("git", arguments_, { cwd: root, encoding: "utf8" }).trim();
+	try {
+		// Exit 0 means gitignore matches the path; the exact negation line is what makes
+		// the declaration committable again.
+		run("check-ignore", "--quiet", relativePath);
+		return `This worktree ignores ${relativePath}; add this exact line to .gitignore to share it: !${relativePath}`;
+	} catch (error) {
+		// Exit 1 means "not ignored"; anything else (including a missing git) is unknown.
+		const exitStatus = (error as { status?: number }).status;
+		if (exitStatus !== 1) return `Git could not say whether ${relativePath} is tracked; check it before committing.`;
+	}
+	try {
+		run("ls-files", "--error-unmatch", relativePath);
+		return `${relativePath} is tracked by Git; commit the change to share it.`;
+	} catch {
+		return `${relativePath} is not ignored, so it is committable as-is.`;
+	}
 }
 
 /** Keep a detail-pane scroll offset inside the bounds of its own content. */
@@ -3595,6 +3745,8 @@ class ProfilesPanel implements OverlayComponent {
 	private readonly theme: Theme | undefined;
 	private readonly rows: () => number;
 	private readonly orchestratorSettings: OrchestratorSettingsReadResult;
+	// Actions reopen the panel, refreshing this snapshot without disk reads during rendering.
+	private readonly pinStatus: ProfilePinStatus | undefined;
 
 	constructor(
 		file: AgentProfilesFile,
@@ -3607,6 +3759,7 @@ class ProfilesPanel implements OverlayComponent {
 		orchestratorSettings: OrchestratorSettingsReadResult,
 		saveSnapshot: ProfilesSnapshotHandler,
 		requestRender: () => void,
+		pinStatus: () => ProfilePinStatus | undefined,
 	) {
 		this.file = file;
 		this.currentConfig = currentConfig;
@@ -3616,7 +3769,8 @@ class ProfilesPanel implements OverlayComponent {
 		this.theme = theme;
 		this.rows = rows;
 		this.orchestratorSettings = orchestratorSettings;
-		const items = buildProfileListItems(file);
+		this.pinStatus = pinStatus();
+		const items = buildProfileListItems(file, evaluateProfilePin(this.pinStatus, file.profiles).winner?.profile);
 		this.listItems = items;
 		this.list = new NativeChoiceList<ProfileListItem>(
 			items,
@@ -3683,6 +3837,8 @@ class ProfilesPanel implements OverlayComponent {
 		if (data === "r") return this.finish({ type: "rename", name });
 		if (data === "x") return this.finish({ type: "delete", name });
 		if (data === "e") return this.finish({ type: "export", name });
+		if (data === "p") return this.finish({ type: "pin", source: "local", name });
+		if (data === "P") return this.finish({ type: "pin", source: "repo", name });
 		this.list.handleInput(data);
 	}
 
@@ -3755,7 +3911,7 @@ class ProfilesPanel implements OverlayComponent {
 	private refreshListItems(): void {
 		// Keep the list instance (and its pointer observer) alive while refreshing the
 		// mutable item records that NativeChoiceList already holds by reference.
-		for (const item of buildProfileListItems(this.file)) {
+		for (const item of buildProfileListItems(this.file, evaluateProfilePin(this.pinStatus, this.file.profiles).winner?.profile)) {
 			const current = this.listItems.find((candidate) => candidate.id === item.id);
 			if (current) Object.assign(current, item);
 		}
@@ -3802,7 +3958,7 @@ class ProfilesPanel implements OverlayComponent {
 
 	private renderFooterRow(width: number): string {
 		const hints =
-			"enter apply · c create · s snapshot · d duplicate · r rename · x delete · e export · i import · j/k line · ctrl+j/k page · esc close";
+			"enter apply · c create · s snapshot · d duplicate · r rename · x delete · e export · i import · p pin · P share · j/k line · ctrl+j/k page · esc close";
 		const text = this.feedback ?? hints;
 		return [
 			this.renderText("│", "border"),
@@ -3833,6 +3989,11 @@ class ProfilesPanel implements OverlayComponent {
 				"text",
 			),
 			this.renderLine(`now           ${this.effectiveOrchestratorLabel()}`, width, "muted"),
+			// A pin only redirects subagent routing, so it is reported next to the
+			// orchestrator lines it deliberately does not move. The winning layer's path,
+			// any invalid or stale layer, and the scope sentence all come from the shared
+			// precedence rule the launch resolver uses.
+			...profilePinDetailLines(this.pinStatus, this.file.profiles).map((line) => this.renderLine(line, width, "muted")),
 			"",
 			this.renderLine("Profile routing", width, "accent"),
 			...this.indentLines(this.routingLines(profileRows, widths), width),
@@ -3896,8 +4057,8 @@ async function showProfilesPanel(
 	selectedName: string | undefined,
 	saveSnapshot: ProfilesSnapshotHandler,
 ): Promise<ProfilesPanelResult> {
-	// Read once, for the panel lifetime. The orchestrator shown as "now" is the
-	// state the panel opened on, not a value that changes mid-panel.
+	// Both orchestrator and pin state are snapshots for this panel visit.
+	// Actions (including p/P) reopen the panel and read fresh state.
 	const orchestratorSettings = readOrchestratorSettings(orchestratorSettingsPath());
 	return ctx.ui.custom<ProfilesPanelResult>(
 		(tui, theme, keybindings, done) => {
@@ -3912,6 +4073,7 @@ async function showProfilesPanel(
 				orchestratorSettings,
 				saveSnapshot,
 				() => tui.requestRender(),
+				() => readProfilePinStatus(ctx.cwd),
 			);
 			const container = createNativeFullscreenInteraction({
 				keyboardTarget: panel,
@@ -3977,6 +4139,31 @@ async function runProfilesPanelAction(
 	switch (result.type) {
 		case "apply": {
 			if (!hasOwnProfile(file.profiles, result.name)) return file;
+			// A pinned repository resolves its subagent routing from the profile at launch,
+			// so a global apply would move global state this repository never reads. When a
+			// pin wins, applying is repo-scoped: re-pin this clone and write no global
+			// routing, no materialized stores, and no orchestrator. The committed
+			// declaration is never rewritten behind a commit.
+			const pinResolution = resolveProfilePin({ cwd: ctx.cwd, configHome: gentleAiConfigHome() });
+			if (pinResolution) {
+				const localPath = pinResolution.status.localPath;
+				let pinNote: string;
+				try {
+					writeProfilePinSync(localPath, result.name);
+					pinNote = `el Gentleman applied profile "${result.name}" repo-scoped: this clone now pins it in ${sanitizeTerminalText(localPath)}.\nSubagent launches here keep resolving the pin; no global routing or orchestrator was written.`;
+				} catch (error) {
+					ctx.ui.notify(
+						`el Gentleman could not pin profile "${result.name}" in ${sanitizeTerminalText(localPath)}: ${profilesErrorMessage(error)}`,
+						"warning",
+					);
+					return file;
+				}
+				if (pinResolution.source === "repo" && pinResolution.path !== localPath) {
+					pinNote += `\nThis worktree's committed declaration ${sanitizeTerminalText(pinResolution.path)} still declares "${pinResolution.profile}"; the clone-local pin now takes precedence.`;
+				}
+				ctx.ui.notify(pinNote, "info");
+				return file;
+			}
 			const normalized = normalizeModelConfig(file.profiles[result.name]) ?? {};
 			const orchestratorEntry = readProfileOrchestrator(normalized);
 			// Applying spans three files — the store, models.json, and Pi's global
@@ -4087,11 +4274,19 @@ async function runProfilesPanelAction(
 					orchestratorNote = `\nOrchestrator set to ${formatOrchestratorSelection(orchestratorEntry)} in ${sanitizeTerminalText(settingsPath)}.`;
 				}
 			}
+			// A pin that does not resolve changes nothing at launch, so the global apply
+			// above is what governs this repository. Saying so keeps a broken pin from
+			// looking like the reason a launch ignored the profile just applied.
+			const pinEvaluation = evaluateProfilePin(readProfilePinStatus(ctx.cwd), file.profiles);
+			let pinNote = "";
+			if (pinEvaluation.stale.length > 0 || pinEvaluation.invalid.length > 0) {
+				pinNote = "\nThis repository also has a pin layer that does not resolve; the global routing above governs its subagents until the pin is fixed.";
+			}
 			ctx.ui.notify(
 				[
 					`el Gentleman applied profile "${result.name}" — ${applyResult.updated} agent${applyResult.updated === 1 ? "" : "s"} updated.`,
 					"New routing takes effect on the next subagent launch.",
-				].join("\n") + orchestratorNote,
+				].join("\n") + orchestratorNote + pinNote,
 				"info",
 			);
 			return claimed;
@@ -4148,6 +4343,16 @@ async function runProfilesPanelAction(
 			try {
 				const next = renameProfile(file, result.name, name.trim());
 				writeProfilesFileSync(path, next);
+				// A pin stores a name, so a rename that did not follow it would leave every
+				// pinned repository with a name the store no longer defines, which silently
+				// returns those repositories to the global routing.
+				const follow = followRenamedPin(ctx.cwd, result.name, name.trim());
+				ctx.ui.notify(
+					`el Gentleman renamed profile "${result.name}" to "${name.trim()}".` +
+						(follow.followed.length > 0 ? `\nUpdated the clone pin: ${follow.followed.map((entry) => sanitizeTerminalText(entry)).join(", ")}.` : "") +
+						(follow.stillDeclared.length > 0 ? `\nThe committed repository declaration ${follow.stillDeclared.map((entry) => sanitizeTerminalText(entry)).join(", ")} still names "${result.name}"; press P on "${name.trim()}" to republish it.` : ""),
+					"info",
+				);
 				return next;
 			} catch (error) {
 				ctx.ui.notify(`Profile not renamed: ${profilesErrorMessage(error)}`, "warning");
@@ -4155,6 +4360,30 @@ async function runProfilesPanelAction(
 			}
 		}
 		case "delete": {
+			// A pinned profile is live state for this repository, so deleting it is
+			// refused the same way deleting the active profile is: the pin must be cleared
+			// deliberately instead of leaving a name that resolves to nothing. Either
+			// layer refuses, not just the winning one, because a non-winning layer still
+			// names a live profile for this repository.
+			const deletePinStatus = readProfilePinStatus(ctx.cwd);
+			const namedLayers: string[] = [];
+			if (deletePinStatus) {
+				for (const layer of [
+					{ scope: "local", read: deletePinStatus.local, path: deletePinStatus.localPath },
+					{ scope: "repo", read: deletePinStatus.repo, path: deletePinStatus.repoPath },
+				]) {
+					if (layer.read.status === "valid" && layer.read.profile === result.name) {
+						namedLayers.push(`${layer.scope} pin at ${sanitizeTerminalText(layer.path)}`);
+					}
+				}
+			}
+			if (namedLayers.length > 0) {
+				ctx.ui.notify(
+					`Profile "${result.name}" is pinned for this repository (${namedLayers.join(" and ")}). Remove the pin first with /gentle:profiles (p removes the clone pin, P removes the declaration), then delete it.`,
+					"warning",
+				);
+				return file;
+			}
 			const approved = await ctx.ui.confirm(
 				"Delete profile?",
 				`Delete profile "${result.name}" from ${path}? The routing in ${modelConfigPath(ctx.cwd)} is not changed.`,
@@ -4168,6 +4397,65 @@ async function runProfilesPanelAction(
 				ctx.ui.notify(`Profile not deleted: ${profilesErrorMessage(error)}`, "warning");
 				return file;
 			}
+		}
+		case "pin": {
+			if (!hasOwnProfile(file.profiles, result.name)) return file;
+			// The pin layer is chosen by the key, not by the file that happens to exist:
+			// `p` sets the local pin in the clone's Git common directory, `P` sets the
+			// committable per-worktree declaration. Both toggle: the same key on the
+			// profile a layer already names removes that layer, so a repository can be
+			// released without editing files by hand. Neither writes routing, so a
+			// failure here has nothing to roll back.
+			const status = readProfilePinStatus(ctx.cwd);
+			if (!status) {
+				ctx.ui.notify(
+					"el Gentleman cannot pin a profile because this session is not inside a Git worktree. Pinning is per repository; apply the profile globally instead.",
+					"warning",
+				);
+				return file;
+			}
+			const pinPath = result.source === "local" ? status.localPath : status.repoPath;
+			const current = result.source === "local" ? status.local : status.repo;
+			const currentlyPinned = current.status === "valid" && current.profile === result.name;
+			const scope = result.source === "local" ? "clone" : "worktree";
+			try {
+				if (currentlyPinned) clearProfilePinSync(pinPath);
+				else writeProfilePinSync(pinPath, result.name);
+			} catch (error) {
+				ctx.ui.notify(
+					`el Gentleman could not update profile pin ${sanitizeTerminalText(pinPath)}: ${profilesErrorMessage(error)}`,
+					"warning",
+				);
+				return file;
+			}
+			if (currentlyPinned) {
+				ctx.ui.notify(
+					[
+						`el Gentleman removed the ${result.source} pin for this ${scope} from ${sanitizeTerminalText(pinPath)}.`,
+						result.source === "local"
+							? "This clone falls back to the repository declaration, then to the global routing."
+							: "This worktree falls back to the global routing; a local pin in the clone still outranks it.",
+					].join("\n"),
+					"info",
+				);
+				return file;
+			}
+			// The sharing line is only worth a Git call when the declaration was just
+			// written, and it must never turn a successful pin into a failure.
+			const sharingNote = result.source === "repo" ? `\n${repoDeclarationSharing(status.root, pinPath)}` : "";
+			ctx.ui.notify(
+				result.source === "local"
+					? [
+						`el Gentleman pinned profile "${result.name}" for this clone in ${sanitizeTerminalText(pinPath)}.`,
+						"Subagent launches in this repository resolve that profile at launch; the orchestrator and every other repository keep their global routing. Press p again to unpin.",
+					].join("\n")
+					: [
+						`el Gentleman declared profile "${result.name}" for this worktree in ${sanitizeTerminalText(pinPath)}.`,
+						"Subagent launches resolve it at launch. Commit the file to share the routing; a local pin takes precedence over it. Press P again to remove the declaration.",
+					].join("\n") + sharingNote,
+				"info",
+			);
+			return file;
 		}
 		case "export": {
 			if (!hasOwnProfile(file.profiles, result.name)) return file;
@@ -8162,6 +8450,7 @@ export const __testing = {
 	resolveReviewModeGate,
 	readEffectiveModelConfig,
 	readEffectiveModelConfigAsync,
+	followRenamedPin,
 	listAgentsFromDir,
 	listAgentsFromDirAsync,
 	listDiscoverableAgents,

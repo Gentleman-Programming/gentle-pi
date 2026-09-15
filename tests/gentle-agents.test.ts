@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { createRequire, syncBuiltinESMExports } from "node:module";
-import { join, relative, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { pendingReviewMutation, REVIEW_REMINDER_RECEIPT } from "../lib/review-reminder-receipt.ts";
 import { SESSION_WORKTREE_ENTRY, SESSION_WORKTREE_CHANGED } from "../lib/session-worktree-registry.ts";
 import test, { after, mock } from "node:test";
@@ -1257,6 +1257,108 @@ for (const [key, tilde] of [["GENTLE_PI_AGENT_HOME", false], ["PI_CODING_AGENT_D
 		}
 	});
 }
+
+// A per-repository profile pin is resolved at launch against the global profiles
+// store. The fixture writes both layers into a sandbox instead of a real clone and
+// binds them to the launch through the worktree resolver the launch already uses,
+// so these tests never depend on the ambient Git state.
+function pinFixture(name: string) {
+	const base = join(root, `pin-${name}`);
+	const worktreeRoot = join(base, "worktree");
+	const commonDir = join(base, "git-common");
+	const configHome = join(base, "config");
+	for (const dir of [worktreeRoot, commonDir, configHome]) mkdirSync(dir, { recursive: true });
+	const writePinText = (path: string, profile: string) => {
+		mkdirSync(dirname(path), { recursive: true });
+		writeFileSync(path, `${JSON.stringify({ kind: "gentle-pi.agent_model_profile_pin", version: 1, profile }, null, 2)}\n`);
+	};
+	const localPinPath = join(commonDir, "gentle-ai", "profile-pin.json");
+	const declarationPath = join(worktreeRoot, ".pi", "gentle-ai", "profile.json");
+	return {
+		root: worktreeRoot,
+		commonDir,
+		configHome,
+		localPinPath,
+		declarationPath,
+		writePin: (profile: string) => writePinText(localPinPath, profile),
+		writeDeclaration: (profile: string) => writePinText(declarationPath, profile),
+		writeStore: (profiles: Record<string, unknown>) => {
+			writeFileSync(join(configHome, "profiles.json"), `${JSON.stringify({ kind: "gentle-pi.agent_model_profiles", version: 1, profiles }, null, 2)}\n`);
+		},
+	};
+}
+
+// The model the child was actually spawned with, resolved for the repository the
+// pin fixture binds to the launch.
+async function launchPinned(base: ReturnType<typeof pinFixture>): Promise<string> {
+	const harness = deps();
+	harness.deps.resolveWorktree = () => ({ root: base.root, commonDir: base.commonDir });
+	harness.deps.env = { PATH: "/bin", GENTLE_PI_CONFIG_HOME: base.configHome };
+	const { pi, tools, fire } = fakePi();
+	gentleAgents(pi, {}, harness.deps);
+	const { ctx } = fakeContext();
+	await fire("session_start", ctx);
+	try {
+		await tools.get("subagent_run")!.execute("pin", { agent: "explore", task: "Map", mode: "background" }, undefined, undefined, ctx);
+		await tick();
+		const args = harness.spawned[0];
+		return args[args.indexOf("--model") + 1];
+	} finally {
+		await fire("session_shutdown", ctx);
+		await tick();
+	}
+}
+
+test("a local pin routes the repository's subagent launches through the pinned profile", async () => {
+	const base = pinFixture("local");
+	base.writeStore({
+		pinned: {
+			// The reserved orchestrator key travels inside the profile but is never
+			// subagent routing.
+			orchestrator: { model: "nan/glm5.3", thinking: "max" },
+			explore: { model: "openai/alpha", thinking: "minimal" },
+		},
+	});
+	base.writePin("pinned");
+	assert.equal(await launchPinned(base), "openai/alpha:minimal");
+});
+
+test("a pinned profile replaces global subagent routing instead of merging it", async () => {
+	const base = pinFixture("replace");
+	// The global subagents.json routes explore at a lower effort and the pinned
+	// profile does not mention explore at all: wholesale replacement returns it to
+	// its definition routing instead of inheriting the global profile.
+	base.writeStore({ pinned: { helper: { model: "openai/beta" } } });
+	base.writePin("pinned");
+	assert.equal(await launchPinned(base), "openai-codex/gpt-5.6-terra:high");
+});
+
+test("a committed repository declaration pins the worktree when no local pin exists", async () => {
+	const base = pinFixture("declaration");
+	base.writeStore({ declared: { explore: { model: "openai/alpha" } } });
+	base.writeDeclaration("declared");
+	assert.equal(await launchPinned(base), "openai/alpha:high");
+});
+
+test("a local pin takes precedence over the worktree's repository declaration", async () => {
+	const base = pinFixture("precedence");
+	base.writeStore({
+		declared: { explore: { model: "openai/alpha" } },
+		local: { explore: { model: "openai/beta" } },
+	});
+	base.writeDeclaration("declared");
+	base.writePin("local");
+	assert.equal(await launchPinned(base), "openai/beta:high");
+});
+
+test("a stale or unreadable pin degrades to the global routing instead of failing the launch", async () => {
+	const base = pinFixture("stale");
+	base.writeStore({ other: { explore: { model: "openai/alpha" } } });
+	base.writePin("deleted-profile");
+	assert.equal(await launchPinned(base), "openai-codex/gpt-5.6-terra:low");
+	writeFileSync(base.localPinPath, "{ not json\n");
+	assert.equal(await launchPinned(base), "openai-codex/gpt-5.6-terra:low");
+});
 
 test("agentsEnabled and agentsCollapseKey read their flags and stay off inside a child", () => {
 	assert.equal(agentsEnabled({}), true);
