@@ -15,7 +15,7 @@ import { Text, type TUI } from "@earendil-works/pi-tui";
 import { sidebarPart } from "../lib/shell-sidebar.ts";
 import { invalidateSidebar } from "../lib/shell-sidebar-layout.ts";
 import { createCompletionQueue } from "../lib/agents-completion-delivery.ts";
-import { AGENT_MODE, discoverAgents, parseAgentDefinition, loadAgentsConfig, resolveAgentProfile, type AgentDefinition, type AgentMode } from "../lib/agents-config.ts";
+import { AGENT_MODE, discoverAgents, parseAgentDefinition, loadAgentsConfig, resolveAgentProfile, withPinnedModelProfiles, type AgentDefinition, type AgentMode } from "../lib/agents-config.ts";
 import { isFinished, TASK_STATUS, TaskStore, type AskRequest, type TaskRecord } from "../lib/agents-protocol.ts";
 import { AgentRunner, piCommand, abortReasonText, plannedCommands, type RemediationPlan, type RemediationScope, REMEDIATION_PLAN_ENV, parseRemediationPlan, remediationEvidence, type AskAnswer, type RunnerDeps, type SddChangeSelection, type TaskRequest, type RemediationTerminalFacts } from "../lib/agents-runner.ts";
 import { ChildMessenger, type IpcEndpoint } from "../lib/agents-messaging.ts";
@@ -28,7 +28,8 @@ import { createNativeFullscreenInteraction } from "../lib/native-fullscreen-inte
 import { AGENTS_GLYPH, renderAgentsCard, widgetExpiryMs, widgetRows } from "../lib/agents-widget.ts";
 import { CARD_TONE, renderCard } from "../lib/shell-card.ts";
 import { openInExternalEditor } from "./gentle-shell.ts";
-import { resolveGentlePiAgentHome } from "../lib/agent-home.ts";
+import { resolveGentlePiAgentHome, gentlePiConfigHome } from "../lib/agent-home.ts";
+import { resolveProfilePin } from "../lib/agent-profile-pin.ts";
 import { assertResearchCheckpoint, parseResearchPersistence, RESEARCH_PERSISTENCE_ENTRY, canonicalArtifactPath, researchAgent, renderResearchCapabilities, RESEARCH_CHILD_TOOLS_ENV, RESEARCH_SELECTION_ENV, RESEARCH_ARTIFACT_ENV, parseResearchArtifactIntent, researchArtifactCall, researchArtifactReadback, type ResearchArtifactIntent, type ResearchWriteIdentity } from "../lib/sdd-research-capabilities.ts";
 import { CHILD_METRICS_EVENT, CHILD_METRICS_REVOKED, childEvent, launchSelection, type LaunchSelection } from "../lib/runtime-metrics-children.ts";
 import { runtimeMetricsEnvAllows, type RuntimeMetricsPolicyDeps } from "../lib/runtime-metrics-policy.ts";
@@ -1137,7 +1138,25 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		const launchSddChange = sddChange === undefined || target === undefined
 			? undefined
 			: { ...sddChange, workspaceRoot: target };
-		const config = loadAgentsConfig(roots(ctx));
+		// A per-repository profile pin replaces subagent routing for this launch without
+		// materialising anything: the global stores stay untouched, so two repositories
+		// worked in parallel stop fighting over one global routing. The child's own
+		// worktree is the repository in question, and the local pin sits in the shared
+		// Git common directory, so it survives every worktree of the clone. When the
+		// launch stays in the session's own worktree the identity already resolved above
+		// is reused instead of asking Git a second time. The orchestrator is out of
+		// scope: only `modelProfiles` is replaced.
+		const pinIdentity: WorktreeResolver = target !== undefined && parentIdentity !== undefined && target === parentIdentity.root
+			? () => parentIdentity
+			: deps.resolveWorktree;
+		const config = withPinnedModelProfiles(
+			loadAgentsConfig(roots(ctx)),
+			resolveProfilePin({
+				cwd: target ?? parentCwd,
+				configHome: gentlePiConfigHome(deps.env),
+				resolveWorktree: pinIdentity,
+			})?.modelProfiles,
+		);
 		const profile = resolveAgentProfile(agent, config);
 		const research = agent.name === "sdd-research" ? researchAgent(agent, pi, researchSelection) : undefined;
 		const sessionDir = agentRuntimePaths(deps.home, agentHome).sessions;
