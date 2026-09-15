@@ -115,13 +115,13 @@ function measureOrchestratorPromptBytes(assetsDir: string): number {
 // ---------------------------------------------------------------------------
 
 // gentle-pi#661: `renderOrchestratorPrompt`/`getOrchestratorPrompt` default
-// `rddStatusLine` to the "unknown (native status unavailable)" line -- the
+// `rddStatusLine` to the "unknown (native status or scope unavailable)" line -- the
 // longest of the three renderable RDD status lines -- precisely so that a
 // no-argument call renders the worst case this budget measures, not a
 // smaller placeholder that production would later exceed. Assert that line
 // is actually present so a future default change cannot silently start
 // measuring a shorter render again.
-const RDD_WORST_CASE_LINE = "Receipt-driven development: unknown (native status unavailable)";
+const RDD_WORST_CASE_LINE = "Receipt-driven development: unknown (native status or scope unavailable)";
 
 test("getOrchestratorPrompt return value stays within the canonical 8,192 B budget at a short assets root", () => {
 	const rendered = __testing.renderOrchestratorPrompt(representativeProductionAssetsDir);
