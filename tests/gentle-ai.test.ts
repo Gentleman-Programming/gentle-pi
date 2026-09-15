@@ -2182,6 +2182,21 @@ test("p pins the selected profile for the clone without touching the global rout
 	assert.match(stripAnsi(renderComponent(reopenedPanel)), /pin\s+local: team/);
 });
 
+test("the profile pin scope note sanitizes its worktree-derived path", (t) => {
+	const { fixture, writeStore } = profilesStoreFixture(t);
+	writeStore({ team: { worker: { model: "openai/alpha" } } }, "team");
+	const commonDir = join(fixture.root, "git-\x1b]52;c;payload\x07-common");
+	const localPath = join(commonDir, "gentle-ai", "profile-pin.json");
+	writeProfilePinSync(localPath, "team");
+	setProfilePinWorktreeResolverForTesting(() => ({ root: fixture.root, commonDir }));
+
+	const note = __testing.profilePinScopeNote(fixture.root);
+	assert.ok(note);
+	assert.doesNotMatch(note, /[\x00-\x1f\x7f-\x9f]/);
+	assert.doesNotMatch(note, /payload/);
+	assert.match(note, /profile-pin\.json/);
+});
+
 test("P declares the profile in the worktree so the routing can be committed", async (t) => {
 	const { fixture, localPinPath, repoPinPath, writeStore } = profilesStoreFixture(t);
 	writeStore({ team: { worker: { model: "openai/alpha" } } }, "team");

@@ -94,6 +94,7 @@ import {
 	clearProfilePinSync,
 	evaluateProfilePin,
 	readProfilePinStatus,
+	REPO_PROFILE_DECLARATION_GITIGNORE_RULES,
 	resolveProfilePin,
 	writeProfilePinSync,
 	type ProfilePinEvaluation,
@@ -3686,7 +3687,9 @@ function followRenamedPin(
 function profilePinScopeNote(cwd: string): string | undefined {
 	const resolution = resolveProfilePin({ cwd, configHome: gentleAiConfigHome() });
 	if (!resolution) return undefined;
-	return `This repository pins profile "${resolution.profile}" (${resolution.source} pin at ${resolution.path}), so its subagent launches resolve that profile instead of the global routing. Change or remove the pin with /gentle:profiles (p or P).`;
+	return sanitizeTerminalText(
+		`This repository pins profile "${resolution.profile}" (${resolution.source} pin at ${resolution.path}), so its subagent launches resolve that profile instead of the global routing. Change or remove the pin with /gentle:profiles (p or P).`,
+	);
 }
 
 /**
@@ -3704,7 +3707,10 @@ function repoDeclarationSharing(root: string, path: string): string {
 		// Exit 0 means gitignore matches the path; the exact negation line is what makes
 		// the declaration committable again.
 		run("check-ignore", "--quiet", relativePath);
-		return `This worktree ignores ${relativePath}; add this exact line to .gitignore to share it: !${relativePath}`;
+		return [
+			`This worktree ignores ${relativePath}; add these exact lines to the root .gitignore to share only this declaration:`,
+			...REPO_PROFILE_DECLARATION_GITIGNORE_RULES,
+		].join("\n");
 	} catch (error) {
 		// Exit 1 means "not ignored"; anything else (including a missing git) is unknown.
 		const exitStatus = (error as { status?: number }).status;
@@ -8451,6 +8457,7 @@ export const __testing = {
 	readEffectiveModelConfig,
 	readEffectiveModelConfigAsync,
 	followRenamedPin,
+	profilePinScopeNote,
 	listAgentsFromDir,
 	listAgentsFromDirAsync,
 	listDiscoverableAgents,

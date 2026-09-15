@@ -30,6 +30,16 @@ import { resolveSessionWorktreeWithGit, type WorktreeIdentity, type WorktreeReso
 
 export const PROFILE_PIN_KIND = "gentle-pi.agent_model_profile_pin";
 export const PROFILE_PIN_VERSION = 1;
+// Ordered root .gitignore rules that expose only the committable declaration.
+// Git cannot re-include a file while an excluded parent directory remains hidden,
+// so each parent is reopened and its unrelated children are ignored again.
+export const REPO_PROFILE_DECLARATION_GITIGNORE_RULES = [
+	"!.pi/",
+	".pi/*",
+	"!.pi/gentle-ai/",
+	".pi/gentle-ai/*",
+	"!.pi/gentle-ai/profile.json",
+] as const;
 
 export interface AgentProfilePinFile {
 	kind: typeof PROFILE_PIN_KIND;
@@ -170,10 +180,11 @@ export function readProfilePin(path: string): string | undefined {
 
 let profilePinWorktreeResolver: WorktreeResolver = resolveSessionWorktreeWithGit;
 
-// Resolving a directory's Git identity shells out to Git and cannot change inside one
-// process, so the answer is memoized per directory. Pin *contents* are never
-// memoized: a pin written mid-session must be visible to the very next read.
-const profilePinWorktreeIdentityCache = new Map<string, WorktreeIdentity | undefined>();
+// Resolving an established Git identity shells out to Git and is stable enough to
+// memoize per directory. Misses are deliberately retried: a long-running Pi session
+// can `git init` its working directory, and caching `undefined` would leave the panel
+// disagreeing with the launch path. Pin *contents* are never memoized.
+const profilePinWorktreeIdentityCache = new Map<string, WorktreeIdentity>();
 
 /**
  * Test seam, mirroring the other injectable seams in `lib/`: the `/gentle:profiles`
@@ -199,16 +210,15 @@ function gentlePiWorktreeIdentity(
 	// Only the ambient resolver is memoized. The launch path injects a resolver per
 	// call, and a memoized answer from a different resolver would be a lie.
 	const memoized = resolveWorktree === profilePinWorktreeResolver;
-	if (memoized && profilePinWorktreeIdentityCache.has(cwd)) {
-		return profilePinWorktreeIdentityCache.get(cwd);
-	}
+	const cached = memoized ? profilePinWorktreeIdentityCache.get(cwd) : undefined;
+	if (cached !== undefined) return cached;
 	let identity: WorktreeIdentity | undefined;
 	try {
 		identity = resolveWorktree(cwd, cwd);
 	} catch {
 		identity = undefined;
 	}
-	if (memoized) profilePinWorktreeIdentityCache.set(cwd, identity);
+	if (memoized && identity !== undefined) profilePinWorktreeIdentityCache.set(cwd, identity);
 	return identity;
 }
 

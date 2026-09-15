@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +8,7 @@ import { createProfile, emptyProfilesFile, profilesFilePath, writeProfilesFileSy
 import {
 	PROFILE_PIN_KIND,
 	PROFILE_PIN_VERSION,
+	REPO_PROFILE_DECLARATION_GITIGNORE_RULES,
 	clearProfilePinSync,
 	evaluateProfilePin,
 	localProfilePinPath,
@@ -48,6 +50,26 @@ function storeAt(configHome: string, profiles: Record<string, AgentModelConfig>)
 test("pin paths follow the shared clone and the worktree", () => {
 	assert.equal(localProfilePinPath("/clone/.git"), join("/clone/.git", "gentle-ai", "profile-pin.json"));
 	assert.equal(repoProfileDeclarationPath("/clone"), join("/clone", ".pi", "gentle-ai", "profile.json"));
+});
+
+test("the suggested ignore rules expose only the repository declaration", () => {
+	const repo = join(root, "ignored-declaration");
+	mkdirSync(repo, { recursive: true });
+	execFileSync("git", ["init", "--quiet", repo]);
+	writeFileSync(join(repo, ".gitignore"), ".pi/\n");
+	writeProfilePinSync(repoProfileDeclarationPath(repo), "team");
+	writeFileSync(join(repo, ".pi", "gentle-ai", "private.json"), "private\n");
+	writeFileSync(join(repo, ".pi", "other.json"), "other\n");
+	writeFileSync(
+		join(repo, ".gitignore"),
+		`.pi/\n${REPO_PROFILE_DECLARATION_GITIGNORE_RULES.join("\n")}\n`,
+	);
+	const visible = execFileSync(
+		"git",
+		["-C", repo, "ls-files", "--others", "--exclude-standard", "--", ".pi"],
+		{ encoding: "utf8" },
+	).trim().split(/\r?\n/).filter(Boolean);
+	assert.deepEqual(visible, [".pi/gentle-ai/profile.json"]);
 });
 
 test("the pin artifact is byte-identical for the same profile", () => {
@@ -129,6 +151,21 @@ test("readProfilePinStatus reads both layers and reports nothing outside a Git w
 		undefined,
 		"a failing resolver reads as no pin instead of failing the panel",
 	);
+});
+
+test("an ambient Git identity miss is retried after the directory becomes a repository", () => {
+	const repo = join(root, "late-git-init");
+	mkdirSync(repo, { recursive: true });
+	resetProfilePinWorktreeIdentityCacheForTesting();
+	try {
+		assert.equal(readProfilePinStatus(repo), undefined);
+		execFileSync("git", ["init", "--quiet", repo]);
+		const status = readProfilePinStatus(repo);
+		assert.ok(status, "a prior miss must not hide a Git identity that appeared later");
+		assert.equal(status.repoPath, repoProfileDeclarationPath(status.root));
+	} finally {
+		resetProfilePinWorktreeIdentityCacheForTesting();
+	}
 });
 
 test("resolveProfilePin prefers the local pin and returns role entries without the orchestrator", () => {

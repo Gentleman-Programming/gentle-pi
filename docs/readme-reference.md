@@ -732,7 +732,17 @@ For a given working directory the winner is the local pin, then the repository d
 
 In a pinned repository the pinned profile governs subagent launches: the agents it names take its model and effort, and the agents it omits return to inherit (their own definition, then the default model). The globally active profile and writes made through `/gentle:models` do not reach those launches, which `/gentle:models` reports when it runs inside a pinned repository. `enter` follows the same boundary: inside a pinned repository it re-pins that repository instead of writing the global routing, so the panel's main key can never move another repository's routing. The panel states which layer won, names the file that holds it, and marks the profile with `(pinned)`.
 
-To share a pin, commit the repository declaration. Repositories that ignore `.pi/` are told this when the file is written, together with the negation line that makes it committable (`!.pi/gentle-ai/profile.json`). Renaming the profile that is this repository's local pin rewrites the local pin; a repository declaration is never rewritten behind a commit, and the panel says to press `P` again when it still names the old profile. Deleting a profile is refused while it is the global active profile, this repository's local pin, or this repository's repository declaration. Pins held by other repositories cannot be enumerated from here and are not checked.
+To share a pin, commit the repository declaration. When `.pi/` is ignored, Git cannot re-include a nested file until its parent directories are visible. The panel therefore prints these ordered root `.gitignore` rules, which keep unrelated `.pi` content ignored while making only the declaration committable:
+
+```gitignore
+!.pi/
+.pi/*
+!.pi/gentle-ai/
+.pi/gentle-ai/*
+!.pi/gentle-ai/profile.json
+```
+
+Renaming the profile that is this repository's local pin rewrites the local pin; a repository declaration is never rewritten behind a commit, and the panel says to press `P` again when it still names the old profile. Deleting a profile is refused while it is the global active profile, this repository's local pin, or this repository's repository declaration. Pins held by other repositories cannot be enumerated from here and are not checked.
 
 A pin that cannot be honored never blocks work and is never destroyed by a read. Running outside a Git worktree, a pin file that is missing or unparseable, and a pin naming a profile the global store does not have are each reported in the panel, and the repository falls back to the globally active profile.
 
