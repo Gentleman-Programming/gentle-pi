@@ -8663,6 +8663,11 @@ function createGentleAiExtensionForTesting(
 		if (typeof event.text !== "string" || !isSddPreflightTrigger(event.text)) {
 			return { action: "continue" };
 		}
+		// An RPC child consumes the parent-rendered preflight block transported in
+		// its task context; it never originates preflight. Re-entering the
+		// parent-only resolver here would reject, and consuming the rejection
+		// would swallow the delegated prompt before the agent ever starts.
+		if (ctx.mode === "rpc") return { action: "continue" };
 		try { await runSddPreflight(ctx); }
 		catch (error) {
 			if (ctx.hasUI) ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
